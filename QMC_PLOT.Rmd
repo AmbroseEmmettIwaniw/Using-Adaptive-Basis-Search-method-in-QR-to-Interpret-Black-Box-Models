@@ -1,0 +1,81 @@
+---
+title: "Breast Rcpp"
+author: "Ambrose Emmett-Iwaniw"
+date: "18/3/2025"
+output: pdf_document
+---
+
+```{r}
+# ============================================================
+# Recreate QMC Comparison Plot — Fixed version
+# Requires: qrng + scrambled_sobol.R (your custom source)
+# install.packages("qrng")
+# ============================================================
+
+library(qrng)
+source("scrambled_sobol.R")
+
+set.seed(20669099)
+n <- 512
+d <- 2
+
+# ---- 1. Uniform (pseudo-random) sequence ----
+uniform_pts <- matrix(runif(n * 2), ncol = 2)
+
+# ---- 2. Sobol sequence (no scrambling) ----
+sobol_pts <- sobol(n, d, randomize = "none")
+
+# ---- 3. Digitally Shifted Sobol sequence ----
+sobol_shifted <- sobol(n, d, randomize = "digital.shift")
+
+# ---- 4. Owen Scrambling (nested scrambled Sobol) ----
+owen_pts <- scrambled_sobol(log2(n), d, seed = sample.int(100000))
+
+# ============================================================
+# Plot — faithfully matches the original image
+# ============================================================
+
+# Save to PNG (same wide aspect ratio as original)
+png("qmc_plot.png", width = 1400, height = 400, res = 110)
+
+par(
+  mfrow    = c(1, 4),          # 1 row, 4 columns
+  mar      = c(3.2, 3.2, 2.2, 0.8),
+  pty      = "s",              # force square plot region
+  mgp      = c(1.8, 0.5, 0),  # axis title / tick labels / ticks
+  tcl      = -0.3,             # tick length (inward)
+  cex.main = 0.88,             # shrink titles so panel 3 doesn't clip
+  font.main = 1                # plain (not bold) title, matching original
+)
+
+axis_at  <- c(0.0, 0.2, 0.4, 0.6, 0.8, 1.0)
+axis_lab <- c("0.0", "0.2", "0.4", "0.6", "0.8", "1.0")
+
+plot_panel <- function(pts, title, col = "black") {
+  plot(
+    pts,
+    xlab       = "",
+    ylab       = "",
+    main       = title,
+    pch        = 1,       # open circles — matches original
+    cex        = 0.55,    # point size — slightly larger so circles are visible
+    col        = col,
+    xlim       = c(0, 1),
+    ylim       = c(0, 1),
+    xaxt       = "n",
+    yaxt       = "n",
+    frame.plot = TRUE
+  )
+  axis(1, at = axis_at, labels = axis_lab, cex.axis = 0.72)
+  axis(2, at = axis_at, labels = axis_lab, cex.axis = 0.72)
+}
+
+plot_panel(uniform_pts,   "Uniform Sequence")
+plot_panel(sobol_pts,     "Sobol Sequence")
+plot_panel(sobol_shifted, "Digitally Shifted Sobol Sequence")
+plot_panel(owen_pts,      "Owen-Scrambling")
+
+dev.off()
+
+message("Saved to qmc_plot.png")
+```

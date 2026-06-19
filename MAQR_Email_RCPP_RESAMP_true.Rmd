@@ -1,0 +1,650 @@
+---
+title: "Email Rcpp"
+author: "Ambrose Emmett-Iwaniw"
+date: "16/8/2023"
+output: pdf_document
+---
+
+```{r setup, include=F}
+knitr::opts_chunk$set(echo = TRUE)
+library(kernlab)
+library(gbm)
+data("spam")
+library(qrng)
+library(Rcpp)
+library(parallel)
+setwd('C:/Users/arsemmet/Desktop/QR Paper Code')
+sourceCpp('QR_code.cpp')
+sourceCpp('Adaptive_QR_helper.cpp')
+source('sensitivity_analysis.R')
+source('data_preparation.R') 
+#source("C:/Users/arsemmet/Desktop/QR Paper Code/scrambled_sobol.R")
+set.seed(20669099)
+```
+
+# Training the Boosted Tree Model.
+
+## Data Preparation
+```{r DP}
+# Data Preparation.
+Type <- spam$type
+Type = as.numeric(Type) - 1
+spam_data <- spam[,-58]
+
+min_spam <- as.double(apply(spam_data,2,min))
+max_spam <- as.double(apply(spam_data,2,max))
+
+spam_data = sweep(spam_data, 2, min_spam)
+spam_data = sweep(spam_data, 2, max_spam - min_spam, FUN='/')
+
+spam_data = cbind(spam_data, Type)
+
+n <- 2^16
+n_steps = log2(n) - log2(2^10) + 1
+m <- 2^16
+d <- ncol(spam_data) - 1
+```
+
+## Data Preparation
+```{r DP}
+# Finite interpretable sets (Arbitrary)
+U <- interpretable_poly_sets(d,2,10,5)
+U = do.call(rbind, U)
+nrow(U)
+```
+
+## Splitting Data
+```{r}
+rnd_sample <- sample(1:nrow(spam))
+
+spam_train <- spam_data[rnd_sample[1:3200],]
+spam_valid <- spam_data[rnd_sample[3201:4000],]
+spam_test <- spam_data[rnd_sample[4001:4601],]
+```
+
+## Fit a Boosted Tree Model on the training data.
+```{r FGBM}
+gbm_spam <- gbm(Type ~ . , data = spam_train ,n.trees = 1000,
+                interaction.depth = 6, distribution = "bernoulli", n.minobsinnode = 10)
+
+# summary(gbm_spam) #Summary gives a table of Variable Importance and a plot of Variable Importance
+```
+## Finding optimal number of trees using validation set.
+```{r}
+n.trees = seq(from=100, to=1000, by=10) #no of trees-a vector of 100 values
+
+#Generating a Prediction matrix for each Tree
+predmatrix <- predict(gbm_spam, spam_valid, n.trees = n.trees,type = "response")
+predmatrix = predmatrix >= 0.5
+predmatrix = 1*predmatrix
+dim(predmatrix)
+
+#Calculating Validation Error curve.
+valid.error <- with(spam_valid,apply(predmatrix!=Type,2,mean))
+head(valid.error) #contains the validation error for each of the 100 trees averaged
+
+#Plotting the test error vs number of trees
+
+plot(n.trees , valid.error , pch=19,col="blue",xlab="Number of Trees",ylab="Test Error", main = "Perfomance of Boosting on Test Set")
+
+which.min(valid.error)
+valid.error[21]
+```
+Based on the results of validation set. optimal number of trees is 300.
+
+## The training, validation and test error for Boosted tree model.
+```{r}
+opt.tree <- 300
+#Generating a Prediction 
+pred_train <- predict(gbm_spam, spam_train, n.trees = opt.tree, type = "response")
+pred_train = 1*(pred_train >= 0.5)
+#Calculating Validation Error curve.
+train_error <- with(spam_train,mean(pred_train!=Type))
+train_error
+
+pred_valid <- predict(gbm_spam, spam_valid, n.trees = opt.tree, type = "response")
+pred_valid = 1*(pred_valid >= 0.5)
+#Calculating Validation Error curve.
+valid_error <- with(spam_valid,mean(pred_valid!=Type))
+valid_error
+
+pred_test <- predict(gbm_spam, spam_test, n.trees = opt.tree, type = "response")
+pred_test = 1*(pred_test >= 0.5)
+#Calculating Validation Error curve.
+test_error <- with(spam_test,mean(pred_test !=Type))
+test_error
+```
+
+training error: $1.22\%$. Validation error: $3.5\%$. Test error: $5.66\%$.
+
+## Variable importance.
+
+```{r}
+summary.gbm(gbm_spam)
+```
+
+## Code to compute LOF.
+
+```{r}
+LOF_EST <- function(d, U, betas, gamma=vector(), n=5000){
+  Int_sqr_err = rep(NA, n)
+  
+  if (length(gamma) == 0)
+    gamma = rep(1, nrow(U))
+  
+  X = gen_unif_mat(n, d)
+  X_df = as.data.frame(X)
+  colnames(X_df) = colnames(spam_data)[-58]
+  f_X <- predict(gbm_spam, X_df, n.trees=opt.tree, type="response")
+  var_f_x = var(f_X)
+  
+  Int_sqr_err = LOF_EST_cpp(d, X, f_X, var_f_x, U, betas, gamma, n=n)
+  
+  list(mean=mean(Int_sqr_err) / var_f_x, sd=sd(Int_sqr_err) / (sqrt(n*var_f_x)), ISE_mean=mean(Int_sqr_err),  ISE_sd=sd(Int_sqr_err) / sqrt(n))
+}
+```
+
+```{r QR, eval=FALSE, include=FALSE}
+start_time_QR <- proc.time()
+Q <- 15
+
+num_cores = detectCores()
+cl <- makeCluster(num_cores)
+
+clusterExport(cl, "n")
+clusterExport(cl, "d")
+clusterExport(cl, "U")
+clusterExport(cl, "spam_data")
+clusterExport(cl, "gbm_spam")
+clusterExport(cl, "opt.tree")
+
+clusterSetRNGStream(cl)
+
+QR_PAR_OUT = clusterEvalQ(cl, 
+             {
+  library(kernlab)
+  library(gbm)
+  library(Rcpp)
+  library(qrng)
+  sourceCpp('C:/Users/ambro/Desktop/QR Paper Code/QR_code.cpp')
+  
+  X = gen_unif_mat(n, d)
+  X_df = as.data.frame(X)
+  colnames(X_df) = colnames(spam_data)[-58]
+  f_X <- predict(gbm_spam, X_df, n.trees=opt.tree, type="response")
+  
+  QR_output = QR_adap(n, U, X, f_X)
+  QR_output
+})
+
+stopCluster(cl)
+
+end_time_QR <- proc.time() - start_time_QR
+```
+
+## Jiang and Owen (2003) Shrinkage approach. 
+
+```{r SQR}
+start_time_SQR <- proc.time()
+
+num_cores = detectCores()
+cl <- makeCluster(num_cores)
+
+clusterExport(cl, "n")
+clusterExport(cl, "d")
+clusterExport(cl, "U")
+clusterExport(cl, "spam_data")
+clusterExport(cl, "gbm_spam")
+clusterExport(cl, "opt.tree")
+clusterExport(cl, "n_steps")
+clusterExport(cl, "LOF_EST")
+
+clusterSetRNGStream(cl)
+
+QRS_PAR_OUT = clusterEvalQ(cl, 
+             {
+  library(gbm)
+  library(Rcpp)
+  sourceCpp('QR_code.cpp')
+  
+  X = gen_unif_mat(n, d)
+  X_df = as.data.frame(X)
+  colnames(X_df) = colnames(spam_data)[-58]
+  f_X <- predict(gbm_spam, X_df, n.trees=opt.tree, type="response")
+  
+  QRS_output = QRS_email(n, U, X, f_X,oracle_shrinkage=FALSE)
+  
+   # Compute LOF estimate.
+  LOF_val = sapply(1:n_steps, FUN=function(i){
+    LOF_EST(d, U, betas = QRS_output[[3*i-2]], gamma=QRS_output[[3*i]])$mean
+  })
+  
+  QRS_output[[length(QRS_output) + 1]] = LOF_val
+  QRS_output
+})
+
+stopCluster(cl)
+
+end_time_SQR <- proc.time() - start_time_SQR
+```
+
+## Collect important info.
+
+```{r}
+betasQRS_Q = matrix(0, nrow=nrow(U), ncol=num_cores)
+LOF_QRS = list()
+para_indx = n_steps * 3 - 2
+
+for (i in 1:num_cores){
+  betasQRS_Q[,i] = QRS_PAR_OUT[[i]][[para_indx]]
+  LOF_QRS[[i]] = QRS_PAR_OUT[[i]][[3*n_steps+1]]
+}
+
+LOF_QRS = do.call(rbind, LOF_QRS)
+
+```
+
+## Shrinkage Sensitivity Analysis For QRS
+
+``` {r SA OQR}
+LOF_QRS_mean = mean(LOF_QRS[,n_steps]) 
+LOF_QRS_sd = sd(LOF_QRS[,n_steps]) / sqrt(num_cores)
+output = sensitivity_analysis_QR_ABS(n,d,U,num_cores, spam_data, betasQRS_Q, LOF_QRS_mean,LOF_QRS_sd, end_time_SQR[[3]])
+
+write.csv(output, file="C:/Users/arsemmet/Desktop/QR Paper Code/Email_results_QRS.csv")
+```
+
+```{r}
+LOF_rate_QRS = lm(log(LOF_QRS[1,]) ~ log(2^seq(10,log2(n),1)))$coefficients[[2]]
+```
+
+## RQMC of Ordinary Quasi-Regression
+
+```{r RQR}
+start_time_RQR <- proc.time()
+
+num_cores = detectCores()
+cl <- makeCluster(num_cores)
+
+clusterExport(cl, "n")
+clusterExport(cl, "d")
+clusterExport(cl, "U")
+clusterExport(cl, "spam_data")
+clusterExport(cl, "gbm_spam")
+clusterExport(cl, "opt.tree")
+clusterExport(cl, "n_steps")
+clusterExport(cl, "LOF_EST")
+
+clusterSetRNGStream(cl)
+
+RQR_PAR_OUT = clusterEvalQ(cl, 
+             {
+  library(kernlab)
+  library(gbm)
+  library(Rcpp)
+  library(qrng)
+  sourceCpp('QR_code.cpp')
+  
+  X = sobol(n, d, randomize = "digital.shift")
+  X_df = as.data.frame(X)
+  colnames(X_df) = colnames(spam_data)[-58]
+  f_X <- predict(gbm_spam, X_df, n.trees=opt.tree, type="response")
+  
+  RQR_output = QR_email(n, U, X, f_X)
+  
+  # Compute LOF estimate.
+  LOF_val = sapply(1:n_steps, FUN=function(i){
+    LOF_EST(d, U, betas = RQR_output[[2*i-1]])$mean
+  })
+  
+  RQR_output[[length(RQR_output) + 1]] = LOF_val
+  RQR_output
+})
+
+stopCluster(cl)
+
+end_time_RQR <- proc.time() - start_time_RQR
+```
+
+## Collect important info.
+
+```{r}
+betasRQR_Q = matrix(0, nrow=nrow(U), ncol=num_cores)
+LOF_RQR = list()
+para_indx = n_steps * 2 - 1
+
+for (i in 1:num_cores){
+  betasRQR_Q[,i] = RQR_PAR_OUT[[i]][[para_indx]]
+  LOF_RQR[[i]] = RQR_PAR_OUT[[i]][[2*n_steps+1]]
+}
+
+LOF_RQR = do.call(rbind, LOF_RQR)
+```
+
+## Shrinkage Sensitivity Analysis For RQR
+
+``` {r SA OQR}
+LOF_RQR_mean = mean(LOF_RQR[,n_steps]) 
+LOF_RQR_sd = sd(LOF_RQR[,n_steps]) / sqrt(num_cores)
+output = sensitivity_analysis_QR_ABS(n,d,U,num_cores, spam_data, betasRQR_Q, LOF_RQR_mean,LOF_RQR_sd, end_time_RQR[[3]])
+
+write.csv(output, file="C:/Users/arsemmet/Desktop/QR Paper Code/Email_results_RQR.csv")
+```
+
+```{r}
+LOF_rate_RQR = lm(log(LOF_RQR[1,]) ~ log(2^seq(10,log2(n),1)))$coefficients[[2]]
+```
+
+## MARQRNS
+
+```{r RQMC MARQR}
+start_time_MARQR <- proc.time()
+
+num_cores = detectCores()
+cl <- makeCluster(num_cores)
+
+clusterExport(cl, "n")
+clusterExport(cl, "m")
+clusterExport(cl, "d")
+clusterExport(cl, "U")
+clusterExport(cl, "spam_data")
+clusterExport(cl, "gbm_spam")
+clusterExport(cl, "opt.tree")
+clusterExport(cl, "n_steps")
+clusterExport(cl, "LOF_EST")
+
+clusterSetRNGStream(cl)
+
+MARQR_PAR_OUT = clusterEvalQ(cl, 
+             {
+  library(kernlab)
+  library(gbm)
+  library(Rcpp)
+  library(qrng)
+  sourceCpp('QR_code.cpp')
+  sourceCpp('Adaptive_QR_helper.cpp')
+  
+  X = sobol(m,d, randomize="digital.shift")
+  X_df = as.data.frame(X)
+  colnames(X_df) = colnames(spam_data)[-58]
+  f_X <- predict(gbm_spam, X_df, n.trees=opt.tree, type="response")
+  
+  RQR_output = MAQRNS(m,2,10,5,X,f_X,0.00001)
+  U_adap <- RQR_output
+  U_spar = do.call(rbind, U_adap)
+  
+  U_comb <- rbind(U_spar,U)
+  sel_basis = duplicated(U_comb)[-(1:nrow(U_spar))]
+  U_spar = U[sel_basis,]
+  
+  X = sobol(n, d, randomize = "digital.shift")
+  X_df = as.data.frame(X)
+  colnames(X_df) = colnames(spam_data)[-58]
+  f_X <- predict(gbm_spam, X_df, n.trees=opt.tree, type="response")
+  
+  MARQR_output = QR_adap(n, U_spar, X, f_X)
+  MARQR_output[[length(MARQR_output) + 1]] = U_spar
+  
+  # Compute LOF estimate.
+  LOF_val = sapply(1:n_steps, FUN=function(i){
+    LOF_EST(d, U_spar, betas = MARQR_output[[2*i-1]])$mean
+  })
+  
+  MARQR_output[[length(MARQR_output) + 1]] = LOF_val
+  
+  MARQR_output
+})
+
+stopCluster(cl)
+
+end_time_MARQR <- proc.time() - start_time_MARQR
+```
+
+## Collect important info.
+
+```{r}
+betasMARQR_Q = list()
+U_MARQR = list()
+LOF_MARQR = list()
+
+for (i in 1:num_cores){
+  betasMARQR_Q[[i]] = MARQR_PAR_OUT[[i]][[2*n_steps - 1]]
+  U_MARQR[[i]] = MARQR_PAR_OUT[[i]][[2*n_steps+1]]
+  LOF_MARQR[[i]] = MARQR_PAR_OUT[[i]][[2*n_steps+2]]
+}
+
+LOF_MARQR = do.call(rbind, LOF_MARQR)
+
+```
+
+## Senstivity Analysis For RQR
+
+``` {r SA OQR}
+LOF_MARQR_mean = mean(LOF_MARQR[,n_steps]) 
+LOF_MARQR_sd = sd(LOF_MARQR[,n_steps]) / sqrt(num_cores)
+#var_rate_MARQR = lm(log(vars_MARQR) ~ log(c(2^10,2^11, 2^12, 2^13, 2^14, 2^15, 2^16, 2^17)))$coefficients[[2]]
+output = sensitivity_analysis_MARQR_ABS(n,d,U_MARQR,num_cores, spam_data, betasMARQR_Q, LOF_MARQR_mean,LOF_MARQR_sd, end_time_MARQR[[3]])
+
+write.csv(output, file="C:/Users/arsemmet/Desktop/QR Paper Code/Email_results_MARQR.csv")
+```
+
+```{r}
+LOF_rate_MARQR = lm(log(LOF_MARQR[1,]) ~ log(2^seq(10,log2(n),1)))$coefficients[[2]]
+```
+
+## MARQRSA
+
+```{r RQMC MARQRSA}
+start_time_MARQRSA <- proc.time()
+
+num_cores = detectCores()
+cl <- makeCluster(num_cores)
+
+clusterExport(cl, "n")
+clusterExport(cl, "m")
+clusterExport(cl, "d")
+clusterExport(cl, "U")
+clusterExport(cl, "spam_data")
+clusterExport(cl, "gbm_spam")
+clusterExport(cl, "opt.tree")
+clusterExport(cl, "n_steps")
+clusterExport(cl, "LOF_EST")
+
+clusterSetRNGStream(cl)
+
+MARQRSA_PAR_OUT = clusterEvalQ(cl, 
+             {
+  library(kernlab)
+  library(gbm)
+  library(Rcpp)
+  library(qrng)
+  sourceCpp('QR_code.cpp')
+  sourceCpp('Adaptive_QR_helper.cpp')
+  
+  X = sobol(m,d, randomize="digital.shift")
+  X_df = as.data.frame(X)
+  colnames(X_df) = colnames(spam_data)[-58]
+  f_X <- predict(gbm_spam, X_df, n.trees=opt.tree, type="response")
+  RQR_output = MAQRSA(m,2,10,5,X,f_X,0.1)
+  U_adap <- RQR_output
+  U_spar = do.call(rbind, U_adap)
+  
+  U_comb <- rbind(U_spar,U)
+  sel_basis = duplicated(U_comb)[-(1:nrow(U_spar))]
+  U_spar = U[sel_basis,]
+  
+  X = sobol(n, d, randomize = "digital.shift")
+  X_df = as.data.frame(X)
+  colnames(X_df) = colnames(spam_data)[-58]
+  f_X <- predict(gbm_spam, X_df, n.trees=opt.tree, type="response")
+  
+  MARQRSA_output = QR_adap(n, U_spar, X, f_X)
+  MARQRSA_output[[length(MARQRSA_output) + 1]] = U_spar
+  
+  # Compute LOF estimate.
+  LOF_val = sapply(1:n_steps, FUN=function(i){
+    LOF_EST(d, U_spar, betas = MARQRSA_output[[2*i-1]])$mean
+  })
+  
+  MARQRSA_output[[length(MARQRSA_output) + 1]] = LOF_val
+  MARQRSA_output
+})
+
+stopCluster(cl)
+
+end_time_MARQRSA <- proc.time() - start_time_MARQRSA
+```
+
+## Collect important info.
+
+```{r}
+betasMARQRSA_Q = list()
+U_MARQRSA = list()
+LOF_MARQRSA = list()
+
+for (i in 1:num_cores){
+  betasMARQRSA_Q[[i]] = MARQRSA_PAR_OUT[[i]][[2*n_steps - 1]]
+  U_MARQRSA[[i]] = MARQRSA_PAR_OUT[[i]][[2*n_steps+1]]
+  LOF_MARQRSA[[i]] = MARQRSA_PAR_OUT[[i]][[2*n_steps+2]]
+}
+
+LOF_MARQRSA = do.call(rbind, LOF_MARQRSA)
+
+```
+
+## Senstivity Analysis For RQR
+
+``` {r SA OQR}
+LOF_MARQRSA_mean = mean(LOF_MARQRSA[,n_steps]) 
+LOF_MARQRSA_sd = sd(LOF_MARQRSA[,n_steps]) / sqrt(num_cores)
+#var_rate_MARQR = lm(log(vars_MARQR) ~ log(c(2^10,2^11, 2^12, 2^13, 2^14, 2^15, 2^16, 2^17)))$coefficients[[2]]
+output = sensitivity_analysis_MARQR_ABS(n,d,U_MARQRSA,num_cores, spam_data, betasMARQRSA_Q, LOF_MARQRSA_mean,LOF_MARQRSA_sd, end_time_MARQRSA[[3]])
+
+write.csv(output, file="C:/Users/arsemmet/Desktop/QR Paper Code/Email_results_MARQRSA.csv")
+```
+
+```{r}
+LOF_rate_MARQRSA = lm(log(LOF_MARQRSA[1,]) ~ log(2^seq(10,log2(n),1)))$coefficients[[2]]
+```
+
+## MARQROS
+
+```{r RQMC MARQROS}
+start_time_MARQROS <- proc.time()
+
+num_cores = detectCores()
+cl <- makeCluster(num_cores)
+
+clusterExport(cl, "n")
+clusterExport(cl, "m")
+clusterExport(cl, "d")
+clusterExport(cl, "U")
+clusterExport(cl, "spam_data")
+clusterExport(cl, "gbm_spam")
+clusterExport(cl, "opt.tree")
+clusterExport(cl, "n_steps")
+clusterExport(cl, "LOF_EST")
+
+clusterSetRNGStream(cl)
+
+MARQROS_PAR_OUT = clusterEvalQ(cl, 
+             {
+  library(kernlab)
+  library(gbm)
+  library(Rcpp)
+  library(qrng)
+  sourceCpp('QR_code.cpp')
+  sourceCpp('Adaptive_QR_helper.cpp')
+  
+  X = sobol(m,d, randomize="digital.shift")
+  X_df = as.data.frame(X)
+  colnames(X_df) = colnames(spam_data)[-58]
+  f_X <- predict(gbm_spam, X_df, n.trees=opt.tree, type="response")
+  RQR_output = MAQROS(m,2,10,5,X,f_X)
+  U_adap <- RQR_output
+  U_spar = do.call(rbind, U_adap)
+  
+  U_comb <- rbind(U_spar,U)
+  sel_basis = duplicated(U_comb)[-(1:nrow(U_spar))]
+  U_spar = U[sel_basis,]
+  
+  X = sobol(n, d, randomize = "digital.shift")
+  X_df = as.data.frame(X)
+  colnames(X_df) = colnames(spam_data)[-58]
+  f_X <- predict(gbm_spam, X_df, n.trees=opt.tree, type="response")
+  
+  MARQROS_output = QR_adap(n, U_spar, X, f_X)
+  MARQROS_output[[length(MARQROS_output) + 1]] = U_spar
+  
+  # Compute LOF estimate.
+  LOF_val = sapply(1:n_steps, FUN=function(i){
+    LOF_EST(d, U_spar, betas = MARQROS_output[[2*i-1]])$mean
+  })
+  
+  MARQROS_output[[length(MARQROS_output) + 1]] = LOF_val
+  MARQROS_output
+})
+
+stopCluster(cl)
+
+end_time_MARQROS <- proc.time() - start_time_MARQROS
+```
+
+## Collect important info.
+
+```{r}
+betasMARQROS_Q = list()
+U_MARQROS = list()
+LOF_MARQROS = list()
+
+for (i in 1:num_cores){
+  betasMARQROS_Q[[i]] = MARQROS_PAR_OUT[[i]][[2*n_steps - 1]]
+  U_MARQROS[[i]] = MARQROS_PAR_OUT[[i]][[2*n_steps+1]]
+  LOF_MARQROS[[i]] = MARQROS_PAR_OUT[[i]][[2*n_steps+2]]
+}
+
+LOF_MARQROS = do.call(rbind, LOF_MARQROS)
+
+```
+
+## Senstivity Analysis For RQR
+
+``` {r SA OQR}
+LOF_MARQROS_mean = mean(LOF_MARQROS[,n_steps]) 
+LOF_MARQROS_sd = sd(LOF_MARQROS[,n_steps]) / sqrt(num_cores)
+#var_rate_MARQR = lm(log(vars_MARQR) ~ log(c(2^10,2^11, 2^12, 2^13, 2^14, 2^15, 2^16, 2^17)))$coefficients[[2]]
+output = sensitivity_analysis_MARQR_ABS(n,d,U_MARQROS,num_cores, spam_data, betasMARQROS_Q, LOF_MARQROS_mean, LOF_MARQROS_sd, end_time_MARQROS[[3]])
+
+write.csv(output, file="C:/Users/arsemmet/Desktop/QR Paper Code/Email_results_MARQROS.csv")
+```
+
+```{r}
+LOF_rate_MARQROS = lm(log(LOF_MARQROS[1,]) ~ log(2^seq(10,log2(n),1)))$coefficients[[2]]
+```
+
+## Results
+
+```{r LOF fits}
+LOF_x_axis = log(2^seq(10,log2(n),1))
+plot(LOF_x_axis, log(unlist(LOF_RQR[1,])), xlab="log(n)", ylab="LOF", ylim=c(-5.5,5.5), col="blue")
+lines(LOF_x_axis, log(unlist(LOF_RQR[1,])), col="blue")
+points(LOF_x_axis, log(unlist(LOF_QRS[1,])),col="green")
+lines(LOF_x_axis, log(unlist(LOF_QRS[1,])),col="green")
+points(LOF_x_axis, log(unlist(LOF_MARQR[1,])), col="purple")
+lines(LOF_x_axis, log(unlist(LOF_MARQR[1,])), col="purple")
+points(LOF_x_axis, log(unlist(LOF_MARQRSA[1,])), col="pink")
+lines(LOF_x_axis, log(unlist(LOF_MARQRSA[1,])), col="pink")
+points(LOF_x_axis, log(unlist(LOF_MARQROS[1,])), col="black")
+lines(LOF_x_axis, log(unlist(LOF_MARQROS[1,])), col="black")
+legend(10, 5.5, legend=c(paste0("RQR (", round(LOF_rate_RQR, 4), ")"), paste0("QRS (", round(LOF_rate_QRS, 4), ")"), paste0("MARQR (", round(LOF_rate_RQRS, 4), ")"), paste0("MARQRSA (", round(LOF_rate_QRRS, 4), ")"),  paste0("MARQRLS (", round(LOF_rate_MARQROS, 4), ")")),
+       col=c("blue", "green", "purple", "pink", "black"), lty=1)
+```
+
+
+```{r runtime}
+end_time_SQR[[3]]
+end_time_RQR[[3]]
+end_time_MARQR[[3]]
+end_time_MARQRSA[[3]]
+end_time_MARQRLS[[3]]
+```

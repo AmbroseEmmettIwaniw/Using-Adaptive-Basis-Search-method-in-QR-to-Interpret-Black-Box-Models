@@ -1,0 +1,759 @@
+---
+title: "Cali Rcpp"
+author: "Ambrose Emmett-Iwaniw"
+date: "16/8/2023"
+output: pdf_document
+---
+
+```{r setup, include=F}
+knitr::opts_chunk$set(echo = TRUE)
+library(kernlab)
+library(gbm)
+library(qrng)
+library(Rcpp)
+library(parallel)
+setwd('C:/Users/arsemmet/Desktop/QR Paper Code/')
+sourceCpp('QR_code.cpp')
+sourceCpp('Adaptive_QR_helper.cpp')
+source('sensitivity_analysis.R')
+source('data_preparation.R') 
+#source("scrambled_sobol.R")
+set.seed(20669099)
+```
+
+# Training the SVM Model.
+
+## Data Preparation
+```{r DP}
+# Data Preparation.
+cali_data = read.csv('housing.csv')
+cali_data <- cali_data[,-10]
+
+cali_data = cali_data[!is.na(cali_data$total_bedrooms),]
+
+medv = log(cali_data$median_house_value, 10)
+
+cali_data <- cali_data[,-9]
+
+min_cali <- as.double(apply(cali_data,2,min))
+max_cali <- as.double(apply(cali_data,2,max))
+
+cali_data = sweep(cali_data, 2, min_cali)
+cali_data = sweep(cali_data, 2, max_cali - min_cali, FUN='/')
+
+cali_data = cbind(cali_data, medv)
+
+n <- 2^17
+m <- 2^16
+d <- ncol(cali_data) - 1
+```
+
+## Data Preparation
+```{r DP}
+# Finite interpretable sets (Arbitrary)
+U <- interpretable_poly_sets(d,3,10,5) # 3,6,4 # 1517
+U = do.call(rbind, U)
+nrow(U)
+```
+
+```{r}
+# Split the dataset into training (70%) and testing (30%) sets
+set.seed(123)  # for reproducibility
+sample_indices <- sample(1:nrow(cali_data), size = 0.7 * nrow(cali_data))
+train_data <- cali_data[sample_indices, ]
+test_data <- cali_data[-sample_indices, ]
+```
+
+```{r include=F, eval=F}
+library(e1071)
+
+# Define the parameter grid
+cost_values <- c(0.1, 1,5, 10)
+gamma_values <- c(0.001,0.01, 0.1, 1)
+
+# Initialize variables to store the best parameters and accuracy
+best_accuracy <- 1
+best_cost <- 0
+best_gamma <- 0
+
+# Nested loops for grid search
+for (cost in cost_values) {
+  for (gamma in gamma_values) {
+    # Train the SVM model with current parameters
+    svm_model <- svm(median_house_value ~ ., data = train_data, kernel = "radial", cost = cost, gamma = gamma)
+    
+    # Make predictions on the test set
+    predictions <- predict(svm_model, test_data)
+    
+    # Evaluate the model
+    accuracy <- sqrt(mean((predictions - test_data$median_house_value)^2))
+    
+    # Update best parameters if accuracy is improved
+    if (best_accuracy > accuracy) {
+      best_accuracy <- accuracy
+      best_cost <- cost
+      best_gamma <- gamma
+    }
+  }
+}
+
+# Print the best parameters and accuracy
+cat("Best Cost:", best_cost, "\n")
+cat("Best Gamma:", best_gamma, "\n")
+cat("Best Accuracy:", best_accuracy, "\n")
+
+```
+
+```{r}
+# NN black-box optimized.
+library(nnet)
+bestmod = nnet(medv ~ ., data=train_data, size=30, skip=T,linout=T, decay=1e-4,maxit=1000)
+
+# training error
+print(sqrt(mean((predict(bestmod, test_data) - test_data$medv)^2)))
+
+#summary(bestmod)
+```
+
+## Code to compute LOF.
+
+```{r}
+LOF_EST <- function(d, U, betas, gamma=vector(), n=10000){
+  Int_sqr_err = rep(NA, n)
+  
+  if (length(gamma) == 0)
+    gamma = rep(1, nrow(U))
+  
+  X = gen_unif_mat(n, d)
+  X_df = as.data.frame(X)
+  colnames(X_df) <- colnames(cali_data[,-9])
+  f_X <- predict(bestmod,X_df)
+  var_f_x = var(f_X)
+  
+  Int_sqr_err = LOF_EST_cpp(d, X, f_X, var_f_x, U, betas, gamma, n=n)
+  
+  list(mean=mean(Int_sqr_err), sd=sd(Int_sqr_err) / (sqrt(n)))
+}
+```
+
+```{r}
+X = gen_unif_mat(2^20, d)
+X_df = as.data.frame(X)
+colnames(X_df) <- colnames(cali_data[,-9])
+f_X <- predict(bestmod,X_df)
+var_f_x = var(f_X)[[1]]
+var_f_x
+```
+
+## Jiang and Owen (2003) Shrinkage approach. 
+
+```{r SQR}
+start_time_SQR <- proc.time()
+
+num_cores = detectCores()
+cl <- makeCluster(num_cores)
+
+clusterExport(cl, "n")
+clusterExport(cl, "d")
+clusterExport(cl, "U")
+clusterExport(cl, "cali_data")
+clusterExport(cl, "bestmod")
+
+clusterSetRNGStream(cl)
+
+QRS_PAR_OUT = clusterEvalQ(cl, 
+             {
+  library(Rcpp)
+  library(nnet)
+  sourceCpp('QR_code.cpp')
+  
+  X = gen_unif_mat(n, d)
+  X_df = as.data.frame(X)
+  colnames(X_df) = colnames(cali_data)[-9]
+  f_X <- predict(bestmod, X_df)
+  
+  QRS_output = QRS_adap(n, U, X, f_X,oracle_shrinkage=FALSE)
+  QRS_output
+})
+
+stopCluster(cl)
+
+end_time_SQR <- proc.time() - start_time_SQR
+```
+
+## Collect important info.
+
+```{r}
+betasQRS_Q = matrix(0, nrow=nrow(U), ncol=num_cores)
+
+for (i in 1:num_cores){
+  betasQRS_Q[,i] = QRS_PAR_OUT[[i]][[22]]
+}
+```
+
+## Compute LOF estimates.
+
+```{r}
+LOF_QRS = sapply(1:8, FUN=function(i){
+  print(i)
+  LOF_est = sapply(1:num_cores, FUN=function(j){
+    LOF_EST(d, U, betas = QRS_PAR_OUT[[j]][[3*i-2]], gamma=QRS_PAR_OUT[[j]][[3*i]])$mean
+    })
+  list(mean=mean(LOF_est)/var_f_x, sd=sd(LOF_est) / sqrt(num_cores*var_f_x))})
+```
+
+## Shrinkage Sensitivity Analysis For QRS
+
+``` {r SA OQR}
+output = sensitivity_analysis_QR_ABS(n,d,U,num_cores, cali_data, betasQRS_Q, LOF_QRS[1,8]$mean,LOF_QRS[2,8]$sd, end_time_SQR[[3]])
+
+write.csv(output, file="Cali_results_QRS.csv")
+```
+
+```{r}
+LOF_rate_QRS = lm(log(unlist(LOF_QRS[1,])) ~ log(c(2^10,2^11, 2^12, 2^13, 2^14, 2^15, 2^16, 2^17)))$coefficients[[2]]
+```
+
+## RQMC of Ordinary Quasi-Regression
+
+```{r RQR}
+start_time_RQR <- proc.time()
+
+num_cores = detectCores()
+cl <- makeCluster(num_cores)
+
+clusterExport(cl, "n")
+clusterExport(cl, "d")
+clusterExport(cl, "U")
+clusterExport(cl, "cali_data")
+clusterExport(cl, "bestmod")
+
+clusterSetRNGStream(cl)
+
+RQR_PAR_OUT = clusterEvalQ(cl, 
+             {
+  library(Rcpp)
+  library(qrng)
+  library(nnet)
+  sourceCpp('QR_code.cpp')
+  
+  X = sobol(n, d, randomize = "digital.shift")
+  X_df = as.data.frame(X)
+  colnames(X_df) = colnames(cali_data)[-9]
+  f_X <- predict(bestmod, X_df)
+  
+  RQR_output = QR_adap(n, U, X, f_X)
+  RQR_output
+})
+
+stopCluster(cl)
+
+end_time_RQR <- proc.time() - start_time_RQR
+```
+
+## Collect important info.
+
+```{r}
+betasRQR_Q = matrix(0, nrow=nrow(U), ncol=num_cores)
+
+for (i in 1:num_cores){
+  betasRQR_Q[,i] = RQR_PAR_OUT[[i]][[15]]
+}
+
+```
+
+## Compute LOF estimates.
+
+```{r}
+LOF_RQR = sapply(1:8, FUN=function(i){
+  print(i)
+  LOF_est = sapply(1:num_cores, FUN=function(j){
+    LOF_EST(d, U, betas = RQR_PAR_OUT[[j]][[2*i-1]])$mean
+    })
+  list(mean=mean(LOF_est)/var_f_x, sd=sd(LOF_est) / sqrt(num_cores*var_f_x))})
+```
+
+## Shrinkage Sensitivity Analysis For RQR
+
+``` {r SA OQR}
+output = sensitivity_analysis_QR_ABS(n,d,U,num_cores, cali_data, betasRQR_Q, LOF_RQR[1,8]$mean,LOF_RQR[2,8]$sd, end_time_RQR[[3]])
+
+write.csv(output, file="Cali_results_RQR.csv")
+```
+
+```{r}
+LOF_rate_RQR = lm(log(unlist(LOF_RQR[1,])) ~ log(c(2^10,2^11, 2^12, 2^13, 2^14, 2^15, 2^16, 2^17)))$coefficients[[2]]
+```
+
+## MARQRSA
+
+```{r RQMC MARQRSA}
+start_time_MARQRSA <- proc.time()
+
+num_cores = detectCores()
+cl <- makeCluster(num_cores)
+
+clusterExport(cl, "n")
+clusterExport(cl, "m")
+clusterExport(cl, "d")
+clusterExport(cl, "U")
+clusterExport(cl, "cali_data")
+clusterExport(cl, "bestmod")
+
+clusterSetRNGStream(cl)
+
+MARQRSA_PAR_OUT = clusterEvalQ(cl, 
+             {
+  library(Rcpp)
+  library(qrng)
+  library(nnet)
+  sourceCpp('QR_code.cpp')
+  sourceCpp('Adaptive_QR_helper.cpp')
+  
+  X = sobol(m,d, randomize="digital.shift")
+  X_df = as.data.frame(X)
+  colnames(X_df) = colnames(cali_data)[-9]
+  f_X <- predict(bestmod, X_df)
+  RQR_output = MAQRSA(m,3,10,5,X,f_X,0.004)
+  U_adap <- RQR_output
+  U_spar = do.call(rbind, U_adap)
+  
+  U_comb <- rbind(U_spar,U)
+  sel_basis = duplicated(U_comb)[-(1:nrow(U_spar))]
+  U_spar = U[sel_basis,]
+  
+  X = sobol(n, d, randomize = "digital.shift")
+  X_df = as.data.frame(X)
+  colnames(X_df) = colnames(cali_data)[-9]
+  f_X <- predict(bestmod, X_df)
+  
+  MARQRSA_output = QR_adap(n, U_spar, X, f_X)
+  MARQRSA_output[[length(MARQRSA_output) + 1]] = U_spar
+  MARQRSA_output
+})
+
+stopCluster(cl)
+
+end_time_MARQRSA <- proc.time() - start_time_MARQRSA
+```
+
+## Collect important info.
+
+```{r}
+betasMARQRSA_Q = list()
+U_MARQRSA = list()
+
+for (i in 1:num_cores){
+  betasMARQRSA_Q[[i]] = MARQRSA_PAR_OUT[[i]][[15]]
+  U_MARQRSA[[i]] = MARQRSA_PAR_OUT[[i]][[17]]
+}
+
+```
+
+## Compute LOF estimates.
+
+```{r}
+LOF_MARQRSA = sapply(1:8, FUN=function(i){
+  print(i)
+  LOF_est = sapply(1:num_cores, FUN=function(j){
+    LOF_EST(d, U_MARQRSA[[j]], betas = MARQRSA_PAR_OUT[[j]][[2*i-1]])$mean
+    })
+  list(mean=mean(LOF_est) / var_f_x, sd=sd(LOF_est) / sqrt(num_cores*var_f_x))})
+```
+
+## Senstivity Analysis For RQR
+
+``` {r SA OQR}
+#var_rate_MARQR = lm(log(vars_MARQR) ~ log(c(2^10,2^11, 2^12, 2^13, 2^14, 2^15, 2^16, 2^17)))$coefficients[[2]]
+output = sensitivity_analysis_MARQR_ABS(n,d,U_MARQRSA,num_cores, cali_data, betasMARQRSA_Q, LOF_MARQRSA[1,8]$mean,LOF_MARQRSA[2,8]$sd, end_time_MARQRSA[[3]])
+
+write.csv(output, file="Cali_results_MARQRSA.csv")
+```
+
+```{r}
+LOF_rate_MARQRSA = lm(log(unlist(LOF_MARQRSA[1,])) ~ log(c(2^10,2^11, 2^12, 2^13, 2^14, 2^15, 2^16, 2^17)))$coefficients[[2]]
+```
+
+## MARQRNNS
+
+```{r RQMC MARQRNNS}
+start_time_MARQRNNS <- proc.time()
+
+num_cores = detectCores()
+cl <- makeCluster(num_cores)
+
+clusterExport(cl, "n")
+clusterExport(cl, "m")
+clusterExport(cl, "d")
+clusterExport(cl, "U")
+clusterExport(cl, "cali_data")
+clusterExport(cl, "bestmod")
+
+clusterSetRNGStream(cl)
+
+MARQRNNS_PAR_OUT = clusterEvalQ(cl, 
+             {
+  library(Rcpp)
+  library(nnet)
+  library(qrng)
+  sourceCpp('QR_code.cpp')
+  sourceCpp('Adaptive_QR_helper.cpp')
+  
+  X = sobol(m,d, randomize="digital.shift")
+  X_df = as.data.frame(X)
+  colnames(X_df) = colnames(cali_data)[-9]
+  f_X <- predict(bestmod, X_df)
+  RQR_output = MAQRNNS(m,3,10,5,X,f_X,0.1)
+  U_adap <- RQR_output
+  U_spar = do.call(rbind, U_adap)
+  
+  U_comb <- rbind(U_spar,U)
+  sel_basis = duplicated(U_comb)[-(1:nrow(U_spar))]
+  U_spar = U[sel_basis,]
+  
+  X = sobol(n, d, randomize = "digital.shift")
+  X_df = as.data.frame(X)
+  colnames(X_df) = colnames(cali_data)[-9]
+  f_X <- predict(bestmod, X_df)
+  
+  MARQRNNS_output = QR_adap(n, U_spar, X, f_X)
+  MARQRNNS_output[[length(MARQRNNS_output) + 1]] = U_spar
+  MARQRNNS_output
+})
+
+stopCluster(cl)
+
+end_time_MARQRNNS <- proc.time() - start_time_MARQRNNS
+```
+
+## Collect important info.
+
+```{r}
+betasMARQRNNS_Q = list()
+U_MARQRNNS = list()
+
+for (i in 1:num_cores){
+  betasMARQRNNS_Q[[i]] = MARQRNNS_PAR_OUT[[i]][[15]]
+  U_MARQRNNS[[i]] = MARQRNNS_PAR_OUT[[i]][[17]]
+}
+
+```
+
+## Compute LOF estimates.
+
+```{r}
+LOF_MARQRNNS = sapply(1:8, FUN=function(i){
+  print(i)
+  LOF_est = sapply(1:num_cores, FUN=function(j){
+    LOF_EST(d, U_MARQRNNS[[j]], betas = MARQRNNS_PAR_OUT[[j]][[2*i-1]])$mean
+    })
+  list(mean=mean(LOF_est)/var_f_x, sd=sd(LOF_est) / sqrt(num_cores*var_f_x))})
+```
+
+## Senstivity Analysis For RQR
+
+``` {r SA OQR}
+#var_rate_MARQRNNS = lm(log(vars_MARQRNNS) ~ log(c(2^10,2^11, 2^12, 2^13, 2^14, 2^15, 2^16, 2^17)))$coefficients[[2]]
+output = sensitivity_analysis_MARQR_ABS(n,d,U_MARQRNNS,num_cores, cali_data, betasMARQRNNS_Q, LOF_MARQRNNS[1,8]$mean,LOF_MARQRNNS[2,8]$sd, end_time_MARQRNNS[[3]])
+
+write.csv(output, file="Cali_results_MARQRNNS.csv")
+```
+
+```{r}
+LOF_rate_MARQRNNS = lm(log(unlist(LOF_MARQRNNS[1,])) ~ log(c(2^10,2^11, 2^12, 2^13, 2^14, 2^15, 2^16, 2^17)))$coefficients[[2]]
+```
+
+## MARQROS
+
+```{r RQMC MARQROS}
+start_time_MARQROS <- proc.time()
+
+num_cores = detectCores()
+cl <- makeCluster(num_cores)
+
+clusterExport(cl, "n")
+clusterExport(cl, "m")
+clusterExport(cl, "d")
+clusterExport(cl, "U")
+clusterExport(cl, "cali_data")
+clusterExport(cl, "bestmod")
+
+clusterSetRNGStream(cl)
+
+MARQROS_PAR_OUT = clusterEvalQ(cl, 
+             {
+  library(Rcpp)
+  library(qrng)
+  library(nnet)
+  sourceCpp('QR_code.cpp')
+  sourceCpp('Adaptive_QR_helper.cpp')
+  
+  X = sobol(m,d, randomize="digital.shift")
+  X_df = as.data.frame(X)
+  colnames(X_df) = colnames(cali_data)[-9]
+  f_X <- predict(bestmod, X_df)
+  RQR_output = MAQROS(m,3,10,5,X,f_X)
+  U_adap <- RQR_output
+  U_spar = do.call(rbind, U_adap)
+  
+  U_comb <- rbind(U_spar,U)
+  sel_basis = duplicated(U_comb)[-(1:nrow(U_spar))]
+  U_spar = U[sel_basis,]
+  
+  X = sobol(n, d, randomize = "digital.shift")
+  X_df = as.data.frame(X)
+  colnames(X_df) = colnames(cali_data)[-9]
+  f_X <- predict(bestmod, X_df)
+  
+  MARQROS_output = QR_adap(n, U_spar, X, f_X)
+  MARQROS_output[[length(MARQROS_output) + 1]] = U_spar
+  MARQROS_output
+})
+
+stopCluster(cl)
+
+end_time_MARQROS <- proc.time() - start_time_MARQROS
+```
+
+## Collect important info.
+
+```{r}
+betasMARQROS_Q = list()
+U_MARQROS = list()
+
+for (i in 1:num_cores){
+  betasMARQROS_Q[[i]] = MARQROS_PAR_OUT[[i]][[15]]
+  U_MARQROS[[i]] = MARQROS_PAR_OUT[[i]][[17]]
+}
+
+```
+
+## Compute LOF estimates.
+
+```{r}
+LOF_MARQROS = sapply(1:8, FUN=function(i){
+  LOF_est = sapply(1:num_cores, FUN=function(j){
+    LOF_EST(d, U_MARQROS[[j]], betas = MARQROS_PAR_OUT[[j]][[2*i-1]])$mean
+    })
+ list(mean=mean(LOF_est)/var_f_x, sd=sd(LOF_est) / sqrt(num_cores*var_f_x))})
+```
+
+## Senstivity Analysis For RQR
+
+``` {r SA OQR}
+#var_rate_MARQR = lm(log(vars_MARQR) ~ log(c(2^10,2^11, 2^12, 2^13, 2^14, 2^15, 2^16, 2^17)))$coefficients[[2]]
+output = sensitivity_analysis_MARQR_ABS(n,d,U_MARQROS,num_cores, cali_data, betasMARQROS_Q, LOF_MARQROS[1,8]$mean,LOF_MARQROS[2,8]$sd, end_time_MARQROS[[3]])
+
+write.csv(output, file="Cali_results_MARQROS.csv")
+```
+
+```{r}
+LOF_rate_MARQROS = lm(log(unlist(LOF_MARQROS[1,])) ~ log(c(2^10,2^11, 2^12, 2^13, 2^14, 2^15, 2^16, 2^17)))$coefficients[[2]]
+```
+
+
+## Results
+
+```{r LOF fits}
+plot(log(c(2^10,2^11, 2^12, 2^13, 2^14, 2^15, 2^16, 2^17)), log(unlist(LOF_RQR[1,])), xlab="log(n)", ylab="LOF", ylim=c(-5.5,5.5), col="blue")
+lines(log(c(2^10,2^11, 2^12, 2^13, 2^14, 2^15, 2^16, 2^17)), log(unlist(LOF_RQR[1,])), col="blue")
+points(log(c(2^10,2^11, 2^12, 2^13, 2^14, 2^15, 2^16, 2^17)), log(unlist(LOF_QRS[1,])),col="green")
+lines(log(c(2^10,2^11, 2^12, 2^13, 2^14, 2^15, 2^16, 2^17)), log(unlist(LOF_QRS[1,])),col="green")
+points(log(c(2^10,2^11, 2^12, 2^13, 2^14, 2^15, 2^16, 2^17)), log(unlist(LOF_MARQRNNS[1,])), col="purple")
+lines(log(c(2^10,2^11, 2^12, 2^13, 2^14, 2^15, 2^16, 2^17)), log(unlist(LOF_MARQRNNS[1,])), col="purple")
+points(log(c(2^10,2^11, 2^12, 2^13, 2^14, 2^15, 2^16, 2^17)), log(unlist(LOF_MARQRSA[1,])), col="pink")
+lines(log(c(2^10,2^11, 2^12, 2^13, 2^14, 2^15, 2^16, 2^17)), log(unlist(LOF_MARQRSA[1,])), col="pink")
+points(log(c(2^10,2^11, 2^12, 2^13, 2^14, 2^15, 2^16, 2^17)), log(unlist(LOF_MARQROS[1,])), col="black")
+lines(log(c(2^10,2^11, 2^12, 2^13, 2^14, 2^15, 2^16, 2^17)), log(unlist(LOF_MARQROS[1,])), col="black")
+legend(10, 5.5, legend=c(paste0("RQR (", round(LOF_rate_RQR, 4), ")"), paste0("QRS (", round(LOF_rate_QRS, 4), ")"), paste0("MARQRNNS (", round(LOF_rate_MARQRNNS, 4), ")"), paste0("MARQRSA (", round(LOF_rate_MARQRSA, 4), ")"),  paste0("MARQROS (", round(LOF_rate_MARQROS, 4), ")")),
+       col=c("blue", "green", "purple", "pink", "black"), lty=1)
+```
+
+
+```{r runtime}
+end_time_SQR[[3]]
+end_time_RQR[[3]]
+end_time_MARQRNNS[[3]]
+end_time_MARQRSA[[3]]
+end_time_MARQROS[[3]]
+```
+
+# Code not used anymore
+
+## MARQRNS
+
+```{r RQMC MARQR}
+start_time_MARQR <- proc.time()
+
+num_cores = detectCores()
+cl <- makeCluster(num_cores)
+
+clusterExport(cl, "n")
+clusterExport(cl, "m")
+clusterExport(cl, "d")
+clusterExport(cl, "U")
+clusterExport(cl, "cali_data")
+clusterExport(cl, "bestmod")
+
+clusterSetRNGStream(cl)
+
+MARQR_PAR_OUT = clusterEvalQ(cl, 
+             {
+  library(Rcpp)
+  library(nnet)
+  library(qrng)
+  sourceCpp('QR_code.cpp')
+  sourceCpp('Adaptive_QR_helper.cpp')
+  
+  X = sobol(m,d, randomize="digital.shift")
+  X_df = as.data.frame(X)
+  colnames(X_df) = colnames(cali_data)[-9]
+  f_X <- predict(bestmod, X_df)
+  RQR_output = MAQRNS(m,3,10,5,X,f_X,0.05)
+  U_adap <- RQR_output
+  U_spar = do.call(rbind, U_adap)
+  
+  U_comb <- rbind(U_spar,U)
+  sel_basis = duplicated(U_comb)[-(1:nrow(U_spar))]
+  U_spar = U[sel_basis,]
+  
+  X = sobol(n, d, randomize = "digital.shift")
+  X_df = as.data.frame(X)
+  colnames(X_df) = colnames(cali_data)[-9]
+  f_X <- predict(bestmod, X_df)
+  
+  MARQR_output = QR_adap(n, U_spar, X, f_X)
+  MARQR_output[[length(MARQR_output) + 1]] = U_spar
+  MARQR_output
+})
+
+stopCluster(cl)
+
+end_time_MARQR <- proc.time() - start_time_MARQR
+```
+
+## Collect important info.
+
+```{r}
+betasMARQR_Q = list()
+U_MARQR = list()
+
+for (i in 1:num_cores){
+  betasMARQR_Q[[i]] = MARQR_PAR_OUT[[i]][[15]]
+  U_MARQR[[i]] = MARQR_PAR_OUT[[i]][[17]]
+}
+
+```
+
+## Compute LOF estimates.
+
+```{r}
+LOF_MARQR = sapply(1:8, FUN=function(i){
+  print(i)
+  LOF_est = sapply(1:num_cores, FUN=function(j){
+    LOF_EST(d, U_MARQR[[j]], betas = MARQR_PAR_OUT[[j]][[2*i-1]])$mean
+    })
+  list(mean=mean(LOF_est)/var_f_x, sd=sd(LOF_est) / sqrt(num_cores*var_f_x))})
+```
+
+## Senstivity Analysis For RQR
+
+``` {r SA OQR}
+#var_rate_MARQR = lm(log(vars_MARQR) ~ log(c(2^10,2^11, 2^12, 2^13, 2^14, 2^15, 2^16, 2^17)))$coefficients[[2]]
+output = sensitivity_analysis_MARQR_ABS(n,d,U_MARQR,num_cores, cali_data, betasMARQR_Q, LOF_MARQR[1,8]$mean,LOF_MARQR[2,8]$sd, end_time_MARQR[[3]])
+
+write.csv(output, file="Cali_results_MARQR.csv")
+```
+
+```{r}
+LOF_rate_MARQR = lm(log(unlist(LOF_MARQR[1,])) ~ log(c(2^10,2^11, 2^12, 2^13, 2^14, 2^15, 2^16, 2^17)))$coefficients[[2]]
+```
+
+
+## MARQRLS
+
+```{r RQMC MARQRLS}
+start_time_MARQRLS <- proc.time()
+
+num_cores = detectCores()
+cl <- makeCluster(num_cores)
+
+clusterExport(cl, "n")
+clusterExport(cl, "m")
+clusterExport(cl, "d")
+clusterExport(cl, "U")
+clusterExport(cl, "cali_data")
+clusterExport(cl, "bestmod")
+
+clusterSetRNGStream(cl)
+
+MARQRLS_PAR_OUT = clusterEvalQ(cl, 
+             {
+  library(Rcpp)
+  library(qrng)
+  library(nnet)
+  sourceCpp('QR_code.cpp')
+  sourceCpp('Adaptive_QR_helper.cpp')
+  
+  X = sobol(m,d, randomize="digital.shift")
+  X_df = as.data.frame(X)
+  colnames(X_df) = colnames(cali_data)[-9]
+  f_X <- predict(bestmod, X_df)
+  RQR_output = MAQRLS(m,3,10,5,X,f_X)
+  U_adap <- RQR_output
+  U_spar = do.call(rbind, U_adap)
+  
+  U_comb <- rbind(U_spar,U)
+  sel_basis = duplicated(U_comb)[-(1:nrow(U_spar))]
+  U_spar = U[sel_basis,]
+  
+  X = sobol(n, d, randomize = "digital.shift")
+  X_df = as.data.frame(X)
+  colnames(X_df) = colnames(cali_data)[-9]
+  f_X <- predict(bestmod, X_df)
+  
+  MARQRLS_output = QR_adap(n, U_spar, X, f_X)
+  MARQRLS_output[[length(MARQRLS_output) + 1]] = U_spar
+  MARQRLS_output
+})
+
+stopCluster(cl)
+
+end_time_MARQRLS <- proc.time() - start_time_MARQRLS
+```
+
+## Collect important info.
+
+```{r}
+betasMARQRLS_Q = list()
+U_MARQRLS = list()
+
+for (i in 1:num_cores){
+  betasMARQRLS_Q[[i]] = MARQRLS_PAR_OUT[[i]][[15]]
+  U_MARQRLS[[i]] = MARQRLS_PAR_OUT[[i]][[17]]
+}
+
+```
+
+## Compute LOF estimates.
+
+```{r}
+LOF_MARQRLS = sapply(1:8, FUN=function(i){
+  LOF_est = sapply(1:num_cores, FUN=function(j){
+    LOF_EST(d, U_MARQRLS[[j]], betas = MARQRLS_PAR_OUT[[j]][[2*i-1]])$mean
+    })
+ list(mean=mean(LOF_est)/var_f_x, sd=sd(LOF_est) / sqrt(num_cores*var_f_x))})
+```
+
+## Senstivity Analysis For RQR
+
+``` {r SA OQR}
+#var_rate_MARQR = lm(log(vars_MARQR) ~ log(c(2^10,2^11, 2^12, 2^13, 2^14, 2^15, 2^16, 2^17)))$coefficients[[2]]
+output = sensitivity_analysis_MARQR_ABS(n,d,U_MARQRLS,num_cores, cali_data, betasMARQRLS_Q, LOF_MARQRLS[1,8]$mean,LOF_MARQRLS[2,8]$sd, end_time_MARQRLS[[3]])
+
+write.csv(output, file="Cali_results_MARQRLS.csv")
+```
+
+```{r}
+LOF_rate_MARQRLS = lm(log(unlist(LOF_MARQRLS[1,])) ~ log(c(2^10,2^11, 2^12, 2^13, 2^14, 2^15, 2^16, 2^17)))$coefficients[[2]]
+```

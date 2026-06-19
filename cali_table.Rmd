@@ -1,0 +1,60 @@
+---
+title: "Table Results Borehole"
+author: "Ambrose Emmett-Iwaniw"
+date: "22/09/2023"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+setwd('C:/Users/arsemmet/Desktop/QR Paper Code/')
+results_QR = as.vector(read.csv("Cali_results_RQR.csv")[,2])
+results_QRS = as.vector(read.csv("Cali_results_QRS.csv")[,2])
+  results_RQR = as.vector(read.csv("Cali_results_MARQRNNS.csv")[,2])
+results_RQRS = as.vector(read.csv("Cali_results_MARQRSA.csv")[,2])
+results_QRRS = as.vector(read.csv("Cali_results_MARQROS.csv")[,2])
+```
+
+
+
+
+\begin{table}
+\bgroup
+\def\arraystretch{1.15}
+\resizebox{16cm}{!}{
+\begin{tabular}{|l |r|r|r|r|r|}
+\hline
+\multicolumn{1}{|l|}{QR Methods} &
+\multicolumn{1}{r|}{RQR} & 
+\multicolumn{1}{r|}{QRS} &
+\multicolumn{1}{r|}{MARQRNNS} &  \multicolumn{1}{r|}{MARQRSA} &  \multicolumn{1}{r|}{MARQROS}\\
+\hline
+LOF & `r results_QR[1]` & `r results_QRS[1]` & `r results_RQR[1]` & `r results_RQRS[1]` & `r results_QRRS[1]` \\
+\hline
+$\text{longitude}$ & `r results_QR[2]` & `r results_QRS[2]` & `r results_RQR[2]` & `r results_RQRS[2]` & `r results_QRRS[2]` \\
+$\text{latitude}$ & `r results_QR[3]` & `r results_QRS[3]` & `r results_RQR[3]` & `r results_RQRS[3]` & `r results_QRRS[3]` \\
+$\text{housing median age}$ & `r results_QR[4]` & `r results_QRS[4]` & `r results_RQR[4]` & `r results_RQRS[4]` & `r results_QRRS[4]` \\
+$\text{total rooms}$ & `r results_QR[5]` & `r results_QRS[5]` & `r results_RQR[5]` & `r results_RQRS[5]` & `r results_QRRS[5]` \\
+$\text{total bedrooms}$ & `r results_QR[6]` & `r results_QRS[6]` & `r results_RQR[6]` & `r results_RQRS[6]` & `r results_QRRS[6]` \\
+$\text{population}$ & `r results_QR[7]` & `r results_QRS[7]` & `r results_RQR[7]` & `r results_RQRS[7]` & `r results_QRRS[7]` \\
+$\text{households}$ & `r results_QR[8]` & `r results_QRS[8]` & `r results_RQR[8]` & `r results_RQRS[8]` & `r results_QRRS[8]` \\
+$\text{median income}$ & `r results_QR[9]` & `r results_QRS[9]` & `r results_RQR[9]` & `r results_RQRS[9]` & `r results_QRRS[9]` \\
+\hline
+Largest Two-Factor & `r results_QR[10]` & `r results_QRS[10]` & `r results_RQR[10]` & `r results_RQRS[10]` & `r results_QRRS[10]` \\
+Effect & `r results_QR[11]` & `r results_QRS[11]` & `r results_RQR[11]` & `r results_RQRS[11]` & `r results_QRRS[11]` \\
+\hline
+Total additive & `r results_QR[12]` & `r results_QRS[12]` & `r results_RQR[12]` & `r results_RQRS[12]` & `r results_QRRS[12]` \\
+Total two-factor & `r results_QR[13]` & `r results_QRS[13]` & `r results_RQR[13]` & `r results_RQRS[13]` & `r results_QRRS[13]` \\
+Total three-factor & `r results_QR[14]` & `r results_QRS[14]` & `r results_RQR[14]` & `r results_RQRS[14]` & `r results_QRRS[14]` \\
+\hline
+Effective Dimension & `r results_QR[15]` & `r results_QRS[15]` & `r results_RQR[15]` & `r results_RQRS[15]` & `r results_QRRS[15]` \\
+Interpretable Set Size  & `r results_QR[16]` & `r results_QRS[16]` & `r results_RQR[16]` & `r results_RQRS[16]` & `r results_QRRS[16]` \\
+\hline
+Run time (Seconds) & `r results_QR[17]` & `r results_QRS[17]` & `r results_RQR[17]` & `r results_RQRS[17]` & `r results_QRRS[17]` \\
+
+Efficiency LOF & `r results_QR[18]` & `r results_QRS[18]` & `r results_RQR[18]` & `r results_RQRS[18]` & `r results_QRRS[18]` \\
+\hline
+\end{tabular}
+}
+\egroup
+\end{table}

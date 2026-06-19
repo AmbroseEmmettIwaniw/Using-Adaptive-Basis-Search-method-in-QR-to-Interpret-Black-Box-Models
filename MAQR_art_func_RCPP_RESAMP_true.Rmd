@@ -1,0 +1,716 @@
+---
+title: "Art Sparse Rcpp"
+author: "Ambrose Emmett-Iwaniw"
+date: "16/8/2023"
+output: pdf_document
+---
+
+```{r setup, include=F}
+knitr::opts_chunk$set(echo = TRUE)
+library(MASS)
+library(qrng)
+library(Rcpp)
+library(parallel)
+sourceCpp('C:/Users/ambro/Desktop/AQR Paper Code/QR_code.cpp')
+sourceCpp('C:/Users/ambro/Desktop/AQR Paper Code/Adaptive_QR_helper.cpp')
+source('C:/Users/ambro/Desktop/AQR Paper Code/sensitivity_analysis.R')
+source('C:/Users/ambro/Desktop/AQR Paper Code/data_preparation.R')
+set.seed(20669099)
+```
+
+## Data Preparation
+```{r DP}
+artifical_sparse_data <- data.frame(matrix(ncol = 8, nrow = 0))
+colnames(artifical_sparse_data) <- c("x1", "x2", "x3", "x4", "x5", "x6", "x7", "x8")
+n <- 2^17
+m <- 2^15
+d <- 8
+# Finite interpretable sets (Arbitrary)
+U <- interpretable_sets(d,3,4,3)
+U = do.call(rbind, U)
+```
+
+# True Beta coefficients.
+
+```{r}
+true_betas = sapply(1:nrow(U), FUN=function(j){
+  if (sum(U[j,] > 0) <= 2 && sum(U[j,]) <= 2 && max(U[j,]) <= 2)
+    (0.8)^sum(U[j,])
+  else
+    0
+})
+```
+
+# Why is Art. Dense function is Dense?
+
+```{r}
+nrow(U)
+total_betas = sum(true_betas[-1]^2)
+sum(sort(true_betas[-1]^2, decreasing = TRUE)[1:20]) / total_betas
+sum(sort(true_betas[-1]^2, decreasing = TRUE)[1:30]) / total_betas
+sum(sort(true_betas[-1]^2, decreasing = TRUE)[1:40]) / total_betas
+```
+
+## Code to compute LOF.
+
+```{r}
+LOF_EST <- function(d, betas, gamma=vector(), true_betas_r){
+  if (length(gamma) == 0)
+    gamma = rep(1, nrow(U))
+  
+  sum((gamma*betas - true_betas_r)^2) / sum(true_betas_r[-1]^2)
+}
+
+LOF_EST_MA <- function(betas, true_betas_r, total_var){
+  sum((betas - true_betas_r)^2) / total_var
+}
+```
+
+
+## Jiang and Owen (2003) Shrinkage approach. 
+
+```{r SQR}
+start_time_SQR <- proc.time()
+
+num_cores = detectCores()
+cl <- makeCluster(num_cores)
+
+clusterExport(cl, "n")
+clusterExport(cl, "d")
+clusterExport(cl, "U")
+clusterExport(cl, "true_betas")
+
+clusterSetRNGStream(cl)
+
+QRS_PAR_OUT = clusterEvalQ(cl, 
+             {
+  library(Rcpp)
+  sourceCpp('C:/Users/arsemmet/Desktop/QR Research/QR_code.cpp')
+  
+  X = gen_unif_mat(n, d)
+  f_X = sapply(1:n, FUN=function(j){artifical_sparse_function(U, X[j,])})
+  
+  QRS_output = QRS_true(n, U, X, f_X, true_betas, oracle_shrinkage = FALSE)
+  QRS_output
+})
+
+stopCluster(cl)
+
+end_time_SQR <- proc.time() - start_time_SQR
+```
+
+## Collect important info.
+
+```{r}
+betasQRS_Q = matrix(0, nrow=nrow(U), ncol=num_cores)
+betaerrQRS_Q = matrix(0, nrow=n, ncol=num_cores)
+
+for (i in 1:num_cores){
+  betasQRS_Q[,i] = QRS_PAR_OUT[[i]][[22]]
+  betaerrQRS_Q[,i] = QRS_PAR_OUT[[i]][[25]]
+}
+
+```
+
+## Collect important info.
+
+```{r}
+betasQRS_Q = matrix(0, nrow=nrow(U), ncol=num_cores)
+betaerrQRS_Q = matrix(0, nrow=n, ncol=num_cores)
+
+for (i in 1:num_cores){
+  betasQRS_Q[,i] = QRS_PAR_OUT[[i]][[22]]
+  betaerrQRS_Q[,i] = QRS_PAR_OUT[[i]][[25]]
+}
+
+```
+
+## Compute LOF estimates.
+
+```{r}
+LOF_QRS = sapply(1:8, FUN=function(i){
+  LOF_est = sapply(1:num_cores, FUN=function(j){
+    LOF_EST(d, betas = QRS_PAR_OUT[[j]][[3*i-2]], gamma=QRS_PAR_OUT[[j]][[3*i]], true_betas_r = true_betas)
+    })
+  list(mean=mean(LOF_est), sd=sd(LOF_est)/ sqrt(num_cores))})
+```
+
+## Shrinkage Sensitivity Analysis For QRS
+
+``` {r SA OQR}
+output = sensitivity_analysis_out(n,d,U,num_cores, artifical_sparse_data, betasQRS_Q, betaerrQRS_Q, LOF_QRS[1,8]$mean,LOF_QRS[2,8]$sd, nrow(U), end_time_SQR[[3]])
+
+write.csv(output, file="C:/Users/arsemmet/Desktop/QR Research/ABS/art_sparse_results_QRS.csv")
+```
+
+```{r}
+True_rate_QRS = lm(log(apply(betaerrQRS_Q, MARGIN=1, mean)) ~ log(1:n))$coefficients[[2]]
+LOF_rate_QRS = lm(log(unlist(LOF_QRS[1,])) ~ log(c(2^10,2^11, 2^12, 2^13, 2^14, 2^15, 2^16, 2^17)))$coefficients[[2]]
+```
+
+## RQMC of Ordinary Quasi-Regression
+
+```{r RQMC QR}
+start_time_RQR <- proc.time()
+Q <- 15
+
+num_cores = detectCores()
+cl <- makeCluster(num_cores)
+
+clusterExport(cl, "n")
+clusterExport(cl, "d")
+clusterExport(cl, "U")
+clusterExport(cl, "true_betas")
+
+clusterSetRNGStream(cl)
+
+RQR_PAR_OUT = clusterEvalQ(cl, 
+             {
+  library(Rcpp)
+  library(qrng)
+  sourceCpp('C:/Users/arsemmet/Desktop/QR Research/QR_code.cpp')
+  
+  X = sobol(n, d, randomize = "digital.shift")
+  f_X = sapply(1:n, FUN=function(j){artifical_sparse_function(U,X[j,])})
+  
+  RQR_output = QR_true(n, U, X, f_X, true_betas)
+  RQR_output
+})
+
+stopCluster(cl)
+
+end_time_RQR <- proc.time() - start_time_RQR
+```
+
+## Collect important info.
+
+```{r}
+betasRQR_Q = matrix(0, nrow=nrow(U), ncol=num_cores)
+betaerrRQR_Q = matrix(0, nrow=n, ncol=num_cores)
+
+for (i in 1:num_cores){
+  betasRQR_Q[,i] = RQR_PAR_OUT[[i]][[15]]
+  betaerrRQR_Q[,i] = RQR_PAR_OUT[[i]][[17]]
+}
+
+```
+
+## Compute LOF estimates.
+
+```{r}
+LOF_RQR = sapply(1:8, FUN=function(i){
+  LOF_est = sapply(1:num_cores, FUN=function(j){
+    LOF_EST(d, betas = RQR_PAR_OUT[[j]][[2*i-1]], true_betas_r = true_betas)
+    })
+  list(mean=mean(LOF_est), sd=sd(LOF_est)/ sqrt(num_cores))})
+```
+
+## Senstivity Analysis For RQR
+
+``` {r SA OQR}
+output = sensitivity_analysis_out(n,d,U,num_cores, artifical_sparse_data, betasRQR_Q, betaerrRQR_Q, LOF_RQR[1,8]$mean,LOF_RQR[2,8]$sd, nrow(U), end_time_RQR[[3]])
+
+write.csv(output, file="C:/Users/arsemmet/Desktop/QR Research/ABS/art_sparse_results_RQR.csv")
+```
+
+```{r}
+True_rate_RQR = lm(log(apply(betaerrRQR_Q, MARGIN=1, mean)) ~ log(1:n))$coefficients[[2]]
+LOF_rate_RQR = lm(log(unlist(LOF_RQR[1,])) ~ log(c(2^10,2^11, 2^12, 2^13, 2^14, 2^15, 2^16, 2^17)))$coefficients[[2]]
+```
+
+## MARQRSA
+
+```{r RQMC MARQR}
+start_time_MARQRSA <- proc.time()
+
+num_cores = detectCores()
+cl <- makeCluster(num_cores)
+
+clusterExport(cl, "n")
+clusterExport(cl, "m")
+clusterExport(cl, "d")
+clusterExport(cl, "U")
+clusterExport(cl, "true_betas")
+
+clusterSetRNGStream(cl)
+
+MARQRSA_PAR_OUT = clusterEvalQ(cl, 
+             {
+  library(Rcpp)
+  library(qrng)
+  sourceCpp('C:/Users/arsemmet/Desktop/QR Research/QR_code.cpp')
+  sourceCpp('C:/Users/arsemmet/Desktop/QR Research/Adaptive_QR_helper.cpp')
+  
+  X = sobol(m,d, randomize="digital.shift")
+  f_X <- sapply(1:m, FUN=function(j){artifical_sparse_function(U,X[j,])})
+  RQR_output = MAQRSA(m,3,4,3,X,f_X,0.02)
+  U_adap <- RQR_output
+  U_spar = do.call(rbind, U_adap)
+  
+  U_comb <- rbind(U_spar,U)
+  sel_basis = duplicated(U_comb)[-(1:nrow(U_spar))]
+  true_betas_spar = true_betas[sel_basis]
+  true_betas_ns = true_betas[!sel_basis]
+  true_betas_trun_error = mean(true_betas_ns^2)
+  U_spar = U[sel_basis,]
+  
+  X = sobol(n, d, randomize = "digital.shift")
+  f_X = sapply(1:n, FUN=function(j){artifical_sparse_function(U,X[j,])})
+  
+  MARQRSA_output = QR_true(n, U_spar, X, f_X, true_betas_spar)
+  MARQRSA_output[[length(MARQRSA_output) + 1]] = U_spar
+  MARQRSA_output[[length(MARQRSA_output) + 1]] = true_betas_trun_error
+   MARQRSA_output[[length(MARQRSA_output) + 1]] = true_betas_spar
+  MARQRSA_output
+})
+
+stopCluster(cl)
+
+end_time_MARQRSA <- proc.time() - start_time_MARQRSA
+```
+
+## Collect important info.
+
+```{r}
+betasMARQRSA_Q = list()
+betaerrMARQRSA_Q = matrix(0, nrow=n, ncol=num_cores)
+U_MARQRSA = list()
+
+for (i in 1:num_cores){
+  betasMARQRSA_Q[[i]] = MARQRSA_PAR_OUT[[i]][[15]]
+  betaerrMARQRSA_Q[,i] = MARQRSA_PAR_OUT[[i]][[17]] + MARQRSA_PAR_OUT[[i]][[19]]
+  U_MARQRSA[[i]] = MARQRSA_PAR_OUT[[i]][[18]]
+}
+
+```
+
+## Compute LOF estimates.
+
+```{r}
+LOF_MARQRSA = sapply(1:8, FUN=function(i){
+  LOF_est = sapply(1:num_cores, FUN=function(j){
+    LOF_EST_MA(betas = MARQRSA_PAR_OUT[[j]][[2*i-1]], true_betas_r = MARQRSA_PAR_OUT[[j]][[20]], total_var = sum(true_betas[-1]^2)) + MARQRSA_PAR_OUT[[j]][[19]] / sum(true_betas[-1]^2)
+    })
+  list(mean=mean(LOF_est), sd=sd(LOF_est) / sqrt(num_cores))})
+```
+
+## Senstivity Analysis For RQR
+
+``` {r SA OQR}
+# var_rate_MARQRSA = lm(log(vars_MARQRSA) ~ log(c(2^10,2^11, 2^12, 2^13, 2^14, 2^15, 2^16, 2^17)))$coefficients[[2]]
+output = sensitivity_analysis_ABS_out(n,d,U_MARQRSA,num_cores, artifical_sparse_data, betasMARQRSA_Q, betaerrMARQRSA_Q, LOF_MARQRSA[1,8]$mean,LOF_MARQRSA[2,8]$sd, end_time_MARQRSA[[3]])
+
+write.csv(output, file="C:/Users/arsemmet/Desktop/QR Research/ABS/art_sparse_results_MARQRSA.csv")
+```
+```{r}
+True_rate_MARQRSA = lm(log(apply(betaerrMARQRSA_Q, MARGIN=1, mean)) ~ log(1:n))$coefficients[[2]]
+LOF_rate_MARQRSA = lm(log(unlist(LOF_MARQRSA[1,])) ~ log(c(2^10,2^11, 2^12, 2^13, 2^14, 2^15, 2^16, 2^17)))$coefficients[[2]]
+```
+
+## MARQROS
+
+```{r RQMC MARQR}
+start_time_MARQROS <- proc.time()
+
+num_cores = detectCores()
+cl <- makeCluster(num_cores)
+
+clusterExport(cl, "n")
+clusterExport(cl, "m")
+clusterExport(cl, "d")
+clusterExport(cl, "U")
+clusterExport(cl, "true_betas")
+
+clusterSetRNGStream(cl)
+
+MARQROS_PAR_OUT = clusterEvalQ(cl, 
+             {
+  library(Rcpp)
+  library(qrng)
+  sourceCpp('C:/Users/arsemmet/Desktop/QR Paper Code/QR_code.cpp')
+  sourceCpp('C:/Users/arsemmet/Desktop/QR Paper Code/Adaptive_QR_helper.cpp')
+  
+  X = sobol(m,d, randomize="digital.shift")
+  f_X <- sapply(1:m, FUN=function(j){artifical_sparse_function(U,X[j,])})
+  RQR_output = MAQROS(m,3,4,3,X,f_X)
+  U_adap <- RQR_output
+  U_spar = do.call(rbind, U_adap)
+  
+  U_comb <- rbind(U_spar,U)
+  sel_basis = duplicated(U_comb)[-(1:nrow(U_spar))]
+  true_betas_spar = true_betas[sel_basis]
+  true_betas_ns = true_betas[!sel_basis]
+  true_betas_trun_error = mean(true_betas_ns^2)
+  U_spar = U[sel_basis,]
+  
+  X = sobol(n, d, randomize = "digital.shift")
+  f_X = sapply(1:n, FUN=function(j){artifical_sparse_function(U,X[j,])})
+  
+  MARQROS_output = QR_true(n, U_spar, X, f_X, true_betas_spar)
+  MARQROS_output[[length(MARQROS_output) + 1]] = U_spar
+  MARQROS_output[[length(MARQROS_output) + 1]] = true_betas_trun_error
+  MARQROS_output[[length(MARQROS_output) + 1]] = true_betas_spar
+  MARQROS_output
+})
+
+stopCluster(cl)
+
+end_time_MARQROS <- proc.time() - start_time_MARQROS
+```
+
+## Collect important info.
+
+```{r}
+betasMARQROS_Q = list()
+betaerrMARQROS_Q = matrix(0, nrow=n, ncol=num_cores)
+U_MARQROS = list()
+
+for (i in 1:num_cores){
+  betasMARQROS_Q[[i]] = MARQROS_PAR_OUT[[i]][[15]]
+  betaerrMARQROS_Q[,i] = MARQROS_PAR_OUT[[i]][[17]] + MARQROS_PAR_OUT[[i]][[19]]
+  U_MARQROS[[i]] = MARQROS_PAR_OUT[[i]][[18]]
+}
+
+```
+
+## Compute LOF estimates.
+
+```{r}
+LOF_MARQROS = sapply(1:8, FUN=function(i){
+  LOF_est = sapply(1:num_cores, FUN=function(j){
+    LOF_EST_MA(betas = MARQROS_PAR_OUT[[j]][[2*i-1]], true_betas_r = MARQROS_PAR_OUT[[j]][[20]], total_var = sum(true_betas[-1]^2)) + MARQROS_PAR_OUT[[j]][[19]] / sum(true_betas[-1]^2)
+    })
+  list(mean=mean(LOF_est), sd=sd(LOF_est) / sqrt(num_cores))})
+```
+
+## Senstivity Analysis For MARQROS
+
+``` {r SA OQR}
+# var_rate_MARQROS = lm(log(vars_MARQROS) ~ log(c(2^10,2^11, 2^12, 2^13, 2^14, 2^15, 2^16, 2^17)))$coefficients[[2]]
+output = sensitivity_analysis_ABS_out(n,d,U_MARQROS,num_cores, artifical_sparse_data, betasMARQROS_Q, betaerrMARQROS_Q, LOF_MARQROS[1,8]$mean,LOF_MARQROS[2,8]$sd, end_time_MARQROS[[3]])
+
+write.csv(output, file="C:/Users/arsemmet/Desktop/QR Research/ABS/art_sparse_results_MARQROS.csv")
+```
+```{r}
+True_rate_MARQROS = lm(log(apply(betaerrMARQROS_Q, MARGIN=1, mean)) ~ log(1:n))$coefficients[[2]]
+LOF_rate_MARQROS = lm(log(unlist(LOF_MARQROS[1,])) ~ log(c(2^10,2^11, 2^12, 2^13, 2^14, 2^15, 2^16, 2^17)))$coefficients[[2]]
+```
+
+```{r}
+betas_var_true = rep(0,num_cores)
+
+for (i in 1:20){
+  betas_var_true[i] = betasMARQROS_Q[[i]][1]
+}
+
+var(betas_var_true)
+```
+
+## MARQRNNS
+
+```{r RQMC MARQRNNS}
+start_time_MARQRNNS <- proc.time()
+
+num_cores = detectCores()
+cl <- makeCluster(num_cores)
+
+clusterExport(cl, "n")
+clusterExport(cl, "m")
+clusterExport(cl, "d")
+clusterExport(cl, "U")
+clusterExport(cl, "true_betas")
+
+clusterSetRNGStream(cl)
+
+MARQRNNS_PAR_OUT = clusterEvalQ(cl, 
+             {
+  library(Rcpp)
+  library(qrng)
+  sourceCpp('C:/Users/arsemmet/Desktop/QR Paper Code/QR_code.cpp')
+  sourceCpp('C:/Users/arsemmet/Desktop/QR Paper Code/Adaptive_QR_helper.cpp')
+  
+  X = sobol(m,d, randomize="digital.shift")
+  f_X <- sapply(1:m, FUN=function(j){artifical_sparse_function(U,X[j,])})
+  RQR_output = MAQRNNS(m,3,4,3,X,f_X,0.05)
+  U_adap <- RQR_output
+  U_spar = do.call(rbind, U_adap)
+  
+  U_comb <- rbind(U_spar,U)
+  sel_basis = duplicated(U_comb)[-(1:nrow(U_spar))]
+  true_betas_spar = true_betas[sel_basis]
+  true_betas_ns = true_betas[!sel_basis]
+  true_betas_trun_error = mean(true_betas_ns^2)
+  U_spar = U[sel_basis,]
+  
+  X = sobol(n, d, randomize = "digital.shift")
+  f_X = sapply(1:n, FUN=function(j){artifical_sparse_function(U,X[j,])})
+  
+  MARQRNNS_output = QR_true(n, U_spar, X, f_X, true_betas_spar)
+  MARQRNNS_output[[length(MARQRNNS_output) + 1]] = U_spar
+  MARQRNNS_output[[length(MARQRNNS_output) + 1]] = true_betas_trun_error
+  MARQRNNS_output[[length(MARQRNNS_output) + 1]] = true_betas_spar
+  MARQRNNS_output
+})
+
+stopCluster(cl)
+
+end_time_MARQRNNS <- proc.time() - start_time_MARQRNNS
+```
+
+## Collect important info.
+
+```{r}
+betasMARQRNNS_Q = list()
+betaerrMARQRNNS_Q = matrix(0, nrow=n, ncol=num_cores)
+U_MARQRNNS = list()
+
+for (i in 1:num_cores){
+  betasMARQRNNS_Q[[i]] = MARQRNNS_PAR_OUT[[i]][[15]]
+  betaerrMARQRNNS_Q[,i] = MARQRNNS_PAR_OUT[[i]][[17]] + MARQRNNS_PAR_OUT[[i]][[19]]
+  U_MARQRNNS[[i]] = MARQRNNS_PAR_OUT[[i]][[18]]
+}
+
+```
+
+## Compute LOF estimates.
+
+```{r}
+LOF_MARQRNNS = sapply(1:8, FUN=function(i){
+  LOF_est = sapply(1:num_cores, FUN=function(j){
+    LOF_EST_MA(betas = MARQRNNS_PAR_OUT[[j]][[2*i-1]], true_betas_r = MARQRNNS_PAR_OUT[[j]][[20]], total_var=sum(true_betas[-1]^2)) + MARQRNNS_PAR_OUT[[j]][[19]] / sum(true_betas[-1]^2)
+    })
+  list(mean=mean(LOF_est), sd=sd(LOF_est) / sqrt(num_cores))})
+```
+
+## Senstivity Analysis For RQR
+
+``` {r SA OQR}
+#var_rate_MARQRNNS = lm(log(vars_MARQRNNS) ~ log(c(2^10,2^11, 2^12, 2^13, 2^14, 2^15, 2^16, 2^17)))$coefficients[[2]]
+output = sensitivity_analysis_ABS_out(n,d,U_MARQRNNS,num_cores, artifical_sparse_data, betasMARQRNNS_Q, betaerrMARQRNNS_Q, LOF_MARQRNNS[1,8]$mean,LOF_MARQRNNS[2,8]$sd, end_time_MARQRNNS[[3]])
+
+write.csv(output, file="C:/Users/arsemmet/Desktop/QR Research/ABS/art_sparse_results_MARQRNNS.csv")
+```
+```{r}
+True_rate_MARQRNNS = lm(log(apply(betaerrMARQRNNS_Q, MARGIN=1, mean)) ~ log(1:n))$coefficients[[2]]
+LOF_rate_MARQRNNS = lm(log(unlist(LOF_MARQRNNS[1,])) ~ log(c(2^10,2^11, 2^12, 2^13, 2^14, 2^15, 2^16, 2^17)))$coefficients[[2]]
+```
+
+## Results
+
+```{r LOF fits}
+plot(log(c(2^10,2^11, 2^12, 2^13, 2^14, 2^15, 2^16, 2^17)), log(unlist(LOF_RQR[1,])), xlab="log(n)", ylab="log(LOF)", ylim=c(-15,2), col="blue")
+lines(log(c(2^10,2^11, 2^12, 2^13, 2^14, 2^15, 2^16, 2^17)), log(unlist(LOF_RQR[1,])), col="blue")
+points(log(c(2^10,2^11, 2^12, 2^13, 2^14, 2^15, 2^16, 2^17)), log(unlist(LOF_QRS[1,])),col="red")
+lines(log(c(2^10,2^11, 2^12, 2^13, 2^14, 2^15, 2^16, 2^17)), log(unlist(LOF_QRS[1,])),col="red")
+points(log(c(2^10,2^11, 2^12, 2^13, 2^14, 2^15, 2^16, 2^17)), log(unlist(LOF_MARQRNNS[1,])), col="purple")
+lines(log(c(2^10,2^11, 2^12, 2^13, 2^14, 2^15, 2^16, 2^17)), log(unlist(LOF_MARQRNNS[1,])), lwd=4, col="purple")
+points(log(c(2^10,2^11, 2^12, 2^13, 2^14, 2^15, 2^16, 2^17)), log(unlist(LOF_MARQRSA[1,])), col="green")
+lines(log(c(2^10,2^11, 2^12, 2^13, 2^14, 2^15, 2^16, 2^17)), log(unlist(LOF_MARQRSA[1,])), lwd=2, col="green")
+points(log(c(2^10,2^11, 2^12, 2^13, 2^14, 2^15, 2^16, 2^17)), log(unlist(LOF_MARQROS[1,])), col="black")
+lines(log(c(2^10,2^11, 2^12, 2^13, 2^14, 2^15, 2^16, 2^17)), log(unlist(LOF_MARQROS[1,])), lwd=1, col="black")
+legend(10, 2, legend=c(paste0("RQR (", round(LOF_rate_RQR, 4), ")"), paste0("QRS (", round(LOF_rate_QRS, 4), ")"), paste0("MARQRNNS (", round(LOF_rate_MARQRNNS, 4), ")"), paste0("MARQRSA (", round(LOF_rate_MARQRSA, 4), ")"), paste0("MARQROS (", round(LOF_rate_MARQROS, 4), ")")),
+       col=c("blue", "red", "purple", "green", "black"), lty=1)
+```
+
+```{r Beta Err fits}
+# LOF curves
+plot(log(1:n), log(apply(betaerrRQR_Q, MARGIN =1, FUN=mean)), xlab="log(n)", ylim=c(-20,10), 
+     col="blue", type="l", main="The Average True Beta Difference curves on the log-scale",
+     ylab="log(Beta_diff)")
+lines(log(1:n), log(apply(betaerrQRS_Q, MARGIN =1, FUN=mean)), col="red")
+lines(log(1:n), log(apply(betaerrMARQRNNS_Q, MARGIN =1, FUN=mean)),lwd=4, col="purple")
+lines(log(1:n), log(apply(betaerrMARQRSA_Q, MARGIN =1, FUN=mean)), lwd=2, col="green")
+lines(log(1:n), log(apply(betaerrMARQROS_Q, MARGIN =1, FUN=mean)), lwd=1, col="black")
+legend(1, -5, legend=c(paste0("RQR (", round(True_rate_RQR, 4), ")"), paste0("QRS (", round(True_rate_QRS, 4), ")"), paste0("MARQRNNS (", round(True_rate_MARQRNNS, 4), ")"), paste0("MAQRSA (", round(True_rate_MARQRSA, 4), ")"), paste0("MARQROS (", round(True_rate_MARQROS, 4), ")")),
+       col=c("blue", "red", "purple", "green", "black"), lty=1)
+```
+
+```{r runtime}
+end_time_SQR[[3]]
+end_time_RQR[[3]]
+end_time_MARQRNNS[[3]]
+end_time_MARQRSA[[3]]
+end_time_MARQROS[[3]]
+```
+
+# Code not used anymore.
+
+## MARQRNS
+
+```{r RQMC MARQR}
+start_time_MARQR <- proc.time()
+
+num_cores = detectCores()
+cl <- makeCluster(num_cores)
+
+clusterExport(cl, "n")
+clusterExport(cl, "m")
+clusterExport(cl, "d")
+clusterExport(cl, "U")
+clusterExport(cl, "true_betas")
+
+clusterSetRNGStream(cl)
+
+MARQR_PAR_OUT = clusterEvalQ(cl, 
+             {
+  library(Rcpp)
+  library(qrng)
+  sourceCpp('C:/Users/arsemmet/Desktop/QR Research/QR_code.cpp')
+  sourceCpp('C:/Users/arsemmet/Desktop/QR Research/Adaptive_QR_helper.cpp')
+  
+  X = sobol(m,d, randomize="digital.shift")
+  f_X <- sapply(1:m, FUN=function(j){artifical_sparse_function(U,X[j,])})
+  RQR_output = MAQRNS(m,3,4,3,X,f_X,0.000001)
+  U_adap <- RQR_output
+  U_spar = do.call(rbind, U_adap)
+  
+  U_comb <- rbind(U_spar,U)
+  sel_basis = duplicated(U_comb)[-(1:nrow(U_spar))]
+  true_betas_spar = true_betas[sel_basis]
+  true_betas_ns = true_betas[!sel_basis]
+  true_betas_trun_error = mean(true_betas_ns^2)
+  U_spar = U[sel_basis,]
+  
+  X = sobol(n, d, randomize = "digital.shift")
+  f_X = sapply(1:n, FUN=function(j){artifical_sparse_function(U,X[j,])})
+  
+  MARQR_output = QR_true(n, U_spar, X, f_X, true_betas_spar)
+  MARQR_output[[length(MARQR_output) + 1]] = U_spar
+  MARQR_output[[length(MARQR_output) + 1]] = true_betas_trun_error
+  MARQR_output[[length(MARQR_output) + 1]] = true_betas_spar
+  MARQR_output
+})
+
+stopCluster(cl)
+
+end_time_MARQR <- proc.time() - start_time_MARQR
+```
+
+## Collect important info.
+
+```{r}
+betasMARQR_Q = list()
+betaerrMARQR_Q = matrix(0, nrow=n, ncol=num_cores)
+U_MARQR = list()
+
+for (i in 1:num_cores){
+  betasMARQR_Q[[i]] = MARQR_PAR_OUT[[i]][[15]]
+  betaerrMARQR_Q[,i] = MARQR_PAR_OUT[[i]][[17]] + MARQR_PAR_OUT[[i]][[19]]
+  U_MARQR[[i]] = MARQR_PAR_OUT[[i]][[18]]
+}
+
+```
+
+## Compute LOF estimates.
+
+```{r}
+LOF_MARQR = sapply(1:8, FUN=function(i){
+  LOF_est = sapply(1:num_cores, FUN=function(j){
+    LOF_EST_MA(betas = MARQR_PAR_OUT[[j]][[2*i-1]], true_betas_r = MARQR_PAR_OUT[[j]][[20]], total_var=sum(true_betas[-1]^2)) + MARQR_PAR_OUT[[j]][[19]] / sum(true_betas[-1]^2)
+    })
+  list(mean=mean(LOF_est), sd=sd(LOF_est) / sqrt(num_cores))})
+```
+
+## Senstivity Analysis For RQR
+
+``` {r SA OQR}
+#var_rate_MARQR = lm(log(vars_MARQR) ~ log(c(2^10,2^11, 2^12, 2^13, 2^14, 2^15, 2^16, 2^17)))$coefficients[[2]]
+output = sensitivity_analysis_ABS_out(n,d,U_MARQR,num_cores, artifical_sparse_data, betasMARQR_Q, betaerrMARQR_Q, LOF_MARQR[1,8]$mean,LOF_MARQR[2,8]$sd, end_time_MARQR[[3]])
+
+write.csv(output, file="C:/Users/arsemmet/Desktop/QR Research/ABS/art_sparse_results_MARQR.csv")
+```
+
+```{r}
+True_rate_MARQR = lm(log(apply(betaerrMARQR_Q, MARGIN=1, mean)) ~ log(1:n))$coefficients[[2]]
+LOF_rate_MARQR = lm(log(unlist(LOF_MARQR[1,])) ~ log(c(2^10,2^11, 2^12, 2^13, 2^14, 2^15, 2^16, 2^17)))$coefficients[[2]]
+```
+
+## MARQRLS
+
+```{r RQMC MARQR}
+start_time_MARQRLS <- proc.time()
+
+num_cores = detectCores()
+cl <- makeCluster(num_cores)
+
+clusterExport(cl, "n")
+clusterExport(cl, "m")
+clusterExport(cl, "d")
+clusterExport(cl, "U")
+clusterExport(cl, "true_betas")
+
+clusterSetRNGStream(cl)
+
+MARQRLS_PAR_OUT = clusterEvalQ(cl, 
+             {
+  library(Rcpp)
+  library(qrng)
+  sourceCpp('C:/Users/arsemmet/Desktop/QR Research/QR_code.cpp')
+  sourceCpp('C:/Users/arsemmet/Desktop/QR Research/Adaptive_QR_helper.cpp')
+  
+  X = sobol(m,d, randomize="digital.shift")
+  f_X <- sapply(1:m, FUN=function(j){artifical_sparse_function(U,X[j,])})
+  RQR_output = MAQRLS(m,3,4,3,X,f_X)
+  U_adap <- RQR_output
+  U_spar = do.call(rbind, U_adap)
+  
+  U_comb <- rbind(U_spar,U)
+  sel_basis = duplicated(U_comb)[-(1:nrow(U_spar))]
+  true_betas_spar = true_betas[sel_basis]
+  true_betas_ns = true_betas[!sel_basis]
+  true_betas_trun_error = mean(true_betas_ns^2)
+  U_spar = U[sel_basis,]
+  
+  X = sobol(n, d, randomize = "digital.shift")
+  f_X = sapply(1:n, FUN=function(j){artifical_sparse_function(U,X[j,])})
+  
+  MARQRLS_output = QR_true(n, U_spar, X, f_X, true_betas_spar)
+  MARQRLS_output[[length(MARQRLS_output) + 1]] = U_spar
+  MARQRLS_output[[length(MARQRLS_output) + 1]] = true_betas_trun_error
+  MARQRLS_output[[length(MARQRLS_output) + 1]] = true_betas_spar
+  MARQRLS_output
+})
+
+stopCluster(cl)
+
+end_time_MARQRLS <- proc.time() - start_time_MARQRLS
+```
+
+## Collect important info.
+
+```{r}
+betasMARQRLS_Q = list()
+betaerrMARQRLS_Q = matrix(0, nrow=n, ncol=num_cores)
+U_MARQRLS = list()
+
+for (i in 1:num_cores){
+  betasMARQRLS_Q[[i]] = MARQRLS_PAR_OUT[[i]][[15]]
+  betaerrMARQRLS_Q[,i] = MARQRLS_PAR_OUT[[i]][[17]] + MARQRLS_PAR_OUT[[i]][[19]]
+  U_MARQRLS[[i]] = MARQRLS_PAR_OUT[[i]][[18]]
+}
+
+```
+
+## Compute LOF estimates.
+
+```{r}
+LOF_MARQRLS = sapply(1:8, FUN=function(i){
+  LOF_est = sapply(1:num_cores, FUN=function(j){
+    LOF_EST_MA(betas = MARQRLS_PAR_OUT[[j]][[2*i-1]], true_betas_r = MARQRLS_PAR_OUT[[j]][[20]], total_var = sum(true_betas[-1]^2)) + MARQRLS_PAR_OUT[[j]][[19]] / sum(true_betas[-1]^2)
+    })
+  list(mean=mean(LOF_est), sd=sd(LOF_est) / sqrt(num_cores))})
+```
+
+## Senstivity Analysis For RQR
+
+``` {r SA OQR}
+# var_rate_MARQRLS = lm(log(vars_MARQRLS) ~ log(c(2^10,2^11, 2^12, 2^13, 2^14, 2^15, 2^16, 2^17)))$coefficients[[2]]
+output = sensitivity_analysis_ABS_out(n,d,U_MARQRLS,num_cores, artifical_sparse_data, betasMARQRLS_Q, betaerrMARQRLS_Q, LOF_MARQRLS[1,8]$mean,LOF_MARQRLS[2,8]$sd, end_time_MARQRLS[[3]])
+
+write.csv(output, file="C:/Users/arsemmet/Desktop/QR Research/ABS/art_sparse_results_MARQRLS.csv")
+```
+
+```{r}
+True_rate_MARQRLS = lm(log(apply(betaerrMARQRLS_Q, MARGIN=1, mean)) ~ log(1:n))$coefficients[[2]]
+LOF_rate_MARQRLS = lm(log(unlist(LOF_MARQRLS[1,])) ~ log(c(2^10,2^11, 2^12, 2^13, 2^14, 2^15, 2^16, 2^17)))$coefficients[[2]]
+```

@@ -1,0 +1,580 @@
+---
+title: "Wing Example Rcpp"
+author: "Ambrose Emmett-Iwaniw"
+date: "16/8/2023"
+output: pdf_document
+---
+
+```{r setup, include=F}
+knitr::opts_chunk$set(echo = TRUE)
+library(MASS)
+library(qrng)
+library(Rcpp)
+library(parallel)
+sourceCpp('C:/Users/arsemmet/Desktop/QR Research/QR_code.cpp')
+sourceCpp('C:/Users/arsemmet/Desktop/QR Research/Adaptive_QR_helper.cpp')
+source('C:/Users/arsemmet/Desktop/QR Research/sensitivity_analysis.R')
+source('C:/Users/arsemmet/Desktop/QR Research/data_preparation.R') 
+true_betas = read.csv("C:/Users/arsemmet/Desktop/QR Research/PAPER SIMULATIONS/true_beta_wings.csv")$x
+set.seed(20669099)
+```
+
+## Data Preparation
+```{r DP}
+wing_data <- data.frame(matrix(ncol = 10, nrow = 0))
+colnames(wing_data) <- c("Sw", "Wfw", "A", "LamCaps", "q", "lam", "tc", "Nz", "Wdg", "Wp")
+n <- 2^17
+m <- 2^15
+d <- 10
+
+U <- interpretable_poly_sets(d,3,8,4)
+U = do.call(rbind, U)
+```
+
+## WING WEIGHT FUNCTION
+
+```{r}
+wingweight <- function(xx)
+{
+  ##########################################################################
+  #
+  # WING WEIGHT FUNCTION
+  #
+  # Authors: Sonja Surjanovic, Simon Fraser University
+  #          Derek Bingham, Simon Fraser University
+  # Questions/Comments: Please email Derek Bingham at dbingham@stat.sfu.ca.
+  #
+  # Copyright 2013. Derek Bingham, Simon Fraser University.
+  #
+  # THERE IS NO WARRANTY, EXPRESS OR IMPLIED. WE DO NOT ASSUME ANY LIABILITY
+  # FOR THE USE OF THIS SOFTWARE.  If software is modified to produce
+  # derivative works, such modified software should be clearly marked.
+  # Additionally, this program is free software; you can redistribute it 
+  # and/or modify it under the terms of the GNU General Public License as 
+  # published by the Free Software Foundation; version 2.0 of the License. 
+  # Accordingly, this program is distributed in the hope that it will be 
+  # useful, but WITHOUT ANY WARRANTY; without even the implied warranty 
+  # of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU 
+  # General Public License for more details.
+  #
+  # For function details and reference information, see:
+  # http://www.sfu.ca/~ssurjano/
+  #
+  ##########################################################################
+  #
+  # OUTPUT AND INPUT:
+  #
+  # y  = wing weight
+  # xx = c(Sw, Wfw, A, LamCaps, q, lam, tc, Nz, Wdg, Wp)
+  #
+  ##########################################################################
+  
+  Sw      <- 150 + (200-150)*xx[1]
+  Wfw     <- 220 + (300-220)*xx[2]
+  A       <- 6 + (10-6)*xx[3]
+  LamCaps <- (-10 + (10 - -10)*xx[4]) * (pi/180)
+  q       <- 16 + (45-16)*xx[5]
+  lam     <- 0.5 + (1 - 0.5)*xx[6]
+  tc      <- 0.08 + (0.18 - 0.08)*xx[7]
+  Nz      <- 2.5 + (6-2.5)*xx[8]
+  Wdg     <- 1700 + (2500 - 1700)*xx[9]
+  Wp      <- 0.025 + (0.08 - 0.025)*xx[10]
+  
+  fact1 <- 0.036 * Sw^0.758 * Wfw^0.0035
+  fact2 <- (A / ((cos(LamCaps))^2))^0.6
+  fact3 <- q^0.006 * lam^0.04
+  fact4 <- (100*tc / cos(LamCaps))^(-0.3)
+  fact5 <- (Nz*Wdg)^0.49
+  
+  term1 <- Sw * Wp
+  
+  y <- fact1*fact2*fact3*fact4*fact5 + term1
+  return(y)
+}
+```
+
+
+# Why is wing function Sparse?
+
+```{r}
+nrow(U)
+total_betas = sum(true_betas[-1]^2)
+sum(sort(true_betas[-1]^2, decreasing = TRUE)[1:5]) / total_betas
+sum(sort(true_betas[-1]^2, decreasing = TRUE)[1:500]) / total_betas
+sum(sort(true_betas[-1]^2, decreasing = TRUE)[1:1000]) / total_betas
+```
+
+## Code to compute LOF.
+
+```{r}
+LOF_EST <- function(d, f, U, betas, gamma=vector(), n=5000){
+  Int_sqr_err = rep(NA, n)
+  
+  if (length(gamma) == 0)
+    gamma = rep(1, nrow(U))
+  
+  X = gen_unif_mat(n, d)
+  f_X = sapply(1:n, FUN=function(j){f(X[j,])})
+  var_f_x = var(f_X)
+  
+  for (i in 1:n){
+    fi_X_i = 0
+    for (j in 1:nrow(U)){
+      fi_X_i = fi_X_i + gamma[j]*betas[j]*mulidimensional_basis(U[j,],X[i,])
+      }
+    Int_sqr_err[i] = (f_X[i] - fi_X_i)^2
+  }
+  
+  list(mean=mean(Int_sqr_err) / var_f_x, sd=sd(Int_sqr_err) / (sqrt(n*var_f_x)))
+}
+```
+
+## Jiang and Owen (2003) Shrinkage approach. 
+
+```{r SQR}
+start_time_SQR <- proc.time()
+
+num_cores = detectCores()
+cl <- makeCluster(num_cores)
+
+clusterExport(cl, "n")
+clusterExport(cl, "d")
+clusterExport(cl, "U")
+clusterExport(cl, "true_betas")
+clusterExport(cl, "wingweight")
+
+clusterSetRNGStream(cl)
+
+QRS_PAR_OUT = clusterEvalQ(cl, 
+             {
+  library(Rcpp)
+  sourceCpp('C:/Users/arsemmet/Desktop/QR Research/QR_code.cpp')
+  
+  X = gen_unif_mat(n, d)
+  f_X = sapply(1:n, FUN=function(j){wingweight(X[j,])})
+  
+  QRS_output = QRS_true(n, U, X, f_X, true_betas,oracle_shrinkage=FALSE)
+  QRS_output
+})
+
+stopCluster(cl)
+
+end_time_SQR <- proc.time() - start_time_SQR
+```
+
+## Collect important info.
+
+```{r}
+betasQRS_Q = matrix(0, nrow=nrow(U), ncol=num_cores)
+betaerrQRS_Q = matrix(0, nrow=n, ncol=num_cores)
+
+for (i in 1:num_cores){
+  betasQRS_Q[,i] = QRS_PAR_OUT[[i]][[22]]
+  betaerrQRS_Q[,i] = QRS_PAR_OUT[[i]][[25]]
+}
+
+```
+
+## Compute LOF estimates.
+
+```{r}
+LOF_QRS = sapply(1:8, FUN=function(i){
+  LOF_est = sapply(1:num_cores, FUN=function(j){
+    LOF_EST(d, wingweight, U, betas = QRS_PAR_OUT[[j]][[3*i-2]], gamma=QRS_PAR_OUT[[j]][[3*i]])$mean
+    })
+  list(mean=mean(LOF_est), sd=sd(LOF_est) / sqrt(num_cores))})
+```
+
+## Shrinkage Sensitivity Analysis For QRS
+
+``` {r SA OQR}
+output = sensitivity_analysis_out(n,d,U,num_cores, wing_data, betasQRS_Q, betaerrQRS_Q, LOF_QRS[1,8]$mean,LOF_QRS[2,8]$sd, nrow(U), end_time_SQR[[3]])
+
+write.csv(output, file="C:/Users/arsemmet/Desktop/QR Research/ABS/wings_results_QRS.csv")
+```
+
+```{r}
+True_rate_QRS = lm(log(apply(betaerrQRS_Q, MARGIN=1, mean)) ~ log(1:n))$coefficients[[2]]
+LOF_rate_QRS = lm(log(unlist(LOF_QRS[1,])) ~ log(c(2^10,2^11, 2^12, 2^13, 2^14, 2^15, 2^16, 2^17)))$coefficients[[2]]
+```
+
+## RQMC of Ordinary Quasi-Regression
+
+```{r RQMC QR}
+start_time_RQR <- proc.time()
+Q <- 15
+
+num_cores = detectCores()
+cl <- makeCluster(num_cores)
+
+clusterExport(cl, "n")
+clusterExport(cl, "d")
+clusterExport(cl, "U")
+clusterExport(cl, "true_betas")
+clusterExport(cl, "wingweight")
+
+clusterSetRNGStream(cl)
+
+RQR_PAR_OUT = clusterEvalQ(cl, 
+             {
+  library(Rcpp)
+  library(qrng)
+  sourceCpp('C:/Users/arsemmet/Desktop/QR Research/QR_code.cpp')
+  
+  X = sobol(n, d, randomize = "digital.shift")
+  f_X = sapply(1:n, FUN=function(j){wingweight(X[j,])})
+  
+  RQR_output = QR_true(n, U, X, f_X, true_betas)
+  RQR_output
+})
+
+stopCluster(cl)
+
+end_time_RQR <- proc.time() - start_time_RQR
+```
+
+## Collect important info.
+
+```{r}
+betasRQR_Q = matrix(0, nrow=nrow(U), ncol=num_cores)
+betaerrRQR_Q = matrix(0, nrow=n, ncol=num_cores)
+
+for (i in 1:num_cores){
+  betasRQR_Q[,i] = RQR_PAR_OUT[[i]][[15]]
+  betaerrRQR_Q[,i] = RQR_PAR_OUT[[i]][[17]]
+}
+
+```
+
+## Compute LOF estimates.
+
+```{r}
+LOF_RQR = sapply(1:8, FUN=function(i){
+  LOF_est = sapply(1:num_cores, FUN=function(j){
+    LOF_EST(d, wingweight, U, betas = RQR_PAR_OUT[[j]][[2*i-1]])$mean
+    })
+  list(mean=mean(LOF_est), sd=sd(LOF_est) / sqrt(num_cores))})
+```
+
+## Senstivity Analysis For RQR
+
+``` {r SA OQR}
+output = sensitivity_analysis_out(n,d,U,num_cores, wing_data, betasRQR_Q, betaerrRQR_Q, LOF_RQR[1,8]$mean,LOF_RQR[2,8]$sd, nrow(U), end_time_RQR[[3]])
+
+write.csv(output, file="C:/Users/arsemmet/Desktop/QR Research/ABS/wings_results_RQR.csv")
+```
+
+```{r}
+True_rate_RQR = lm(log(apply(betaerrRQR_Q, MARGIN=1, mean)) ~ log(1:n))$coefficients[[2]]
+LOF_rate_RQR = lm(log(unlist(LOF_RQR[1,])) ~ log(c(2^10,2^11, 2^12, 2^13, 2^14, 2^15, 2^16, 2^17)))$coefficients[[2]]
+```
+
+
+## MARQRNS
+
+```{r RQMC MARQR}
+start_time_MARQR <- proc.time()
+
+num_cores = detectCores()
+cl <- makeCluster(num_cores)
+
+clusterExport(cl, "n")
+clusterExport(cl, "m")
+clusterExport(cl, "d")
+clusterExport(cl, "U")
+clusterExport(cl, "true_betas")
+clusterExport(cl, "wingweight")
+
+clusterSetRNGStream(cl)
+
+MARQR_PAR_OUT = clusterEvalQ(cl, 
+             {
+  library(Rcpp)
+  library(qrng)
+  sourceCpp('C:/Users/arsemmet/Desktop/QR Research/QR_code.cpp')
+  sourceCpp('C:/Users/arsemmet/Desktop/QR Research/Adaptive_QR_helper.cpp')
+  
+  X = sobol(m,d, randomize="digital.shift")
+  f_X <- sapply(1:m, FUN=function(j){wingweight(X[j,])})
+  RQR_output = MAQRNS(m,3,8,4,X,f_X,0.00001)
+  U_adap <- RQR_output
+  U_spar = do.call(rbind, U_adap)
+  
+  U_comb <- rbind(U_spar,U)
+  sel_basis = duplicated(U_comb)[-(1:nrow(U_spar))]
+  true_betas_spar = true_betas[sel_basis]
+  true_betas_ns = true_betas[!sel_basis]
+  true_betas_trun_error = mean(true_betas_ns^2)
+  U_spar = U[sel_basis,]
+  
+  X = sobol(n, d, randomize = "digital.shift")
+  f_X = sapply(1:n, FUN=function(j){wingweight(X[j,])})
+  
+  MARQR_output = QR_true(n, U_spar, X, f_X, true_betas_spar)
+  MARQR_output[[length(MARQR_output) + 1]] = U_spar
+  MARQR_output[[length(MARQR_output) + 1]] = true_betas_trun_error
+  MARQR_output
+})
+
+stopCluster(cl)
+
+end_time_MARQR <- proc.time() - start_time_MARQR
+```
+
+## Collect important info.
+
+```{r}
+betasMARQR_Q = list()
+betaerrMARQR_Q = matrix(0, nrow=n, ncol=num_cores)
+U_MARQR = list()
+
+for (i in 1:num_cores){
+  betasMARQR_Q[[i]] = MARQR_PAR_OUT[[i]][[15]]
+  betaerrMARQR_Q[,i] = MARQR_PAR_OUT[[i]][[17]] + MARQR_PAR_OUT[[i]][[19]]
+  U_MARQR[[i]] = MARQR_PAR_OUT[[i]][[18]]
+}
+
+```
+
+## Compute LOF estimates.
+
+```{r}
+LOF_MARQR = sapply(1:8, FUN=function(i){
+  LOF_est = sapply(1:num_cores, FUN=function(j){
+    LOF_EST(d, wingweight, U_MARQR[[j]], betas = MARQR_PAR_OUT[[j]][[2*i-1]])$mean
+    })
+  list(mean=mean(LOF_est), sd=sd(LOF_est) / sqrt(num_cores))})
+```
+
+## Senstivity Analysis For RQR
+
+``` {r SA OQR}
+#var_rate_MARQR = lm(log(vars_MARQR) ~ log(c(2^10,2^11, 2^12, 2^13, 2^14, 2^15, 2^16, 2^17)))$coefficients[[2]]
+output = sensitivity_analysis_ABS_out(n,d,U_MARQR,num_cores, wing_data, betasMARQR_Q, betaerrMARQR_Q, LOF_MARQR[1,8]$mean,LOF_MARQR[2,8]$sd, end_time_MARQR[[3]])
+
+write.csv(output, file="C:/Users/arsemmet/Desktop/QR Research/ABS/wings_results_MARQR.csv")
+```
+
+```{r}
+True_rate_MARQR = lm(log(apply(betaerrMARQR_Q, MARGIN=1, mean)) ~ log(1:n))$coefficients[[2]]
+LOF_rate_MARQR = lm(log(unlist(LOF_MARQR[1,])) ~ log(c(2^10,2^11, 2^12, 2^13, 2^14, 2^15, 2^16, 2^17)))$coefficients[[2]]
+```
+
+## MARQRSA
+
+```{r RQMC MARQR}
+start_time_MARQRSA <- proc.time()
+
+num_cores = detectCores()
+cl <- makeCluster(num_cores)
+
+clusterExport(cl, "n")
+clusterExport(cl, "m")
+clusterExport(cl, "d")
+clusterExport(cl, "U")
+clusterExport(cl, "true_betas")
+clusterExport(cl, "wingweight")
+
+clusterSetRNGStream(cl)
+
+MARQRSA_PAR_OUT = clusterEvalQ(cl, 
+             {
+  library(Rcpp)
+  library(qrng)
+  sourceCpp('C:/Users/arsemmet/Desktop/QR Research/QR_code.cpp')
+  sourceCpp('C:/Users/arsemmet/Desktop/QR Research/Adaptive_QR_helper.cpp')
+  
+  X = sobol(m,d, randomize="digital.shift")
+  f_X <- sapply(1:m, FUN=function(j){wingweight(X[j,])})
+  RQR_output = MAQRSA(m,3,8,4,X,f_X,0.0001)
+  U_adap <- RQR_output
+  U_spar = do.call(rbind, U_adap)
+  
+  U_comb <- rbind(U_spar,U)
+  sel_basis = duplicated(U_comb)[-(1:nrow(U_spar))]
+  true_betas_spar = true_betas[sel_basis]
+  true_betas_ns = true_betas[!sel_basis]
+  true_betas_trun_error = mean(true_betas_ns^2)
+  U_spar = U[sel_basis,]
+  
+  X = sobol(n, d, randomize = "digital.shift")
+  f_X = sapply(1:n, FUN=function(j){wingweight(X[j,])})
+  
+  MARQRSA_output = QR_true(n, U_spar, X, f_X, true_betas_spar)
+  MARQRSA_output[[length(MARQRSA_output) + 1]] = U_spar
+  MARQRSA_output[[length(MARQRSA_output) + 1]] = true_betas_trun_error
+  MARQRSA_output
+})
+
+stopCluster(cl)
+
+end_time_MARQRSA <- proc.time() - start_time_MARQRSA
+```
+
+## Collect important info.
+
+```{r}
+betasMARQRSA_Q = list()
+betaerrMARQRSA_Q = matrix(0, nrow=n, ncol=num_cores)
+U_MARQRSA = list()
+
+for (i in 1:num_cores){
+  betasMARQRSA_Q[[i]] = MARQRSA_PAR_OUT[[i]][[15]]
+  betaerrMARQRSA_Q[,i] = MARQRSA_PAR_OUT[[i]][[17]] + MARQRSA_PAR_OUT[[i]][[19]]
+  U_MARQRSA[[i]] = MARQRSA_PAR_OUT[[i]][[18]]
+}
+
+```
+
+## Compute LOF estimates.
+
+```{r}
+LOF_MARQRSA = sapply(1:8, FUN=function(i){
+  LOF_est = sapply(1:num_cores, FUN=function(j){
+    LOF_EST(d, wingweight, U_MARQRSA[[j]], betas = MARQRSA_PAR_OUT[[j]][[2*i-1]])$mean
+    })
+  list(mean=mean(LOF_est), sd=sd(LOF_est) / sqrt(num_cores))})
+```
+
+## Senstivity Analysis For RQR
+
+``` {r SA OQR}
+# var_rate_MARQRSA = lm(log(vars_MARQRSA) ~ log(c(2^10,2^11, 2^12, 2^13, 2^14, 2^15, 2^16, 2^17)))$coefficients[[2]]
+output = sensitivity_analysis_ABS_out(n,d,U_MARQRSA,num_cores, wing_data, betasMARQRSA_Q, betaerrMARQRSA_Q, LOF_MARQRSA[1,8]$mean,LOF_MARQRSA[2,8]$sd, end_time_MARQRSA[[3]])
+
+write.csv(output, file="C:/Users/arsemmet/Desktop/QR Research/ABS/wings_results_MARQRSA.csv")
+```
+
+```{r}
+True_rate_MARQRSA = lm(log(apply(betaerrMARQRSA_Q, MARGIN=1, mean)) ~ log(1:n))$coefficients[[2]]
+LOF_rate_MARQRSA = lm(log(unlist(LOF_MARQRSA[1,])) ~ log(c(2^10,2^11, 2^12, 2^13, 2^14, 2^15, 2^16, 2^17)))$coefficients[[2]]
+```
+
+## MARQRLS
+
+```{r RQMC MARQR}
+start_time_MARQRLS <- proc.time()
+
+num_cores = detectCores()
+cl <- makeCluster(num_cores)
+
+clusterExport(cl, "n")
+clusterExport(cl, "m")
+clusterExport(cl, "d")
+clusterExport(cl, "U")
+clusterExport(cl, "true_betas")
+clusterExport(cl, "wingweight")
+
+clusterSetRNGStream(cl)
+
+MARQRLS_PAR_OUT = clusterEvalQ(cl, 
+             {
+  library(Rcpp)
+  library(qrng)
+  sourceCpp('C:/Users/arsemmet/Desktop/QR Research/QR_code.cpp')
+  sourceCpp('C:/Users/arsemmet/Desktop/QR Research/Adaptive_QR_helper.cpp')
+  
+  X = sobol(m,d, randomize="digital.shift")
+  f_X <- sapply(1:m, FUN=function(j){wingweight(X[j,])})
+  RQR_output = MAQRLS(m,3,8,4,X,f_X)
+  U_adap <- RQR_output
+  U_spar = do.call(rbind, U_adap)
+  
+  U_comb <- rbind(U_spar,U)
+  sel_basis = duplicated(U_comb)[-(1:nrow(U_spar))]
+  true_betas_spar = true_betas[sel_basis]
+  true_betas_ns = true_betas[!sel_basis]
+  true_betas_trun_error = mean(true_betas_ns^2)
+  U_spar = U[sel_basis,]
+  
+  X = sobol(n, d, randomize = "digital.shift")
+  f_X = sapply(1:n, FUN=function(j){wingweight(X[j,])})
+  
+  MARQRLS_output = QR_true(n, U_spar, X, f_X, true_betas_spar)
+  MARQRLS_output[[length(MARQRLS_output) + 1]] = U_spar
+  MARQRLS_output[[length(MARQRLS_output) + 1]] = true_betas_trun_error
+  MARQRLS_output
+})
+
+stopCluster(cl)
+
+end_time_MARQRLS <- proc.time() - start_time_MARQRLS
+```
+
+## Collect important info.
+
+```{r}
+betasMARQRLS_Q = list()
+betaerrMARQRLS_Q = matrix(0, nrow=n, ncol=num_cores)
+U_MARQRLS = list()
+
+for (i in 1:num_cores){
+  betasMARQRLS_Q[[i]] = MARQRLS_PAR_OUT[[i]][[15]]
+  betaerrMARQRLS_Q[,i] = MARQRLS_PAR_OUT[[i]][[17]] + MARQRLS_PAR_OUT[[i]][[19]]
+  U_MARQRLS[[i]] = MARQRLS_PAR_OUT[[i]][[18]]
+}
+
+```
+
+## Compute LOF estimates.
+
+```{r}
+LOF_MARQRLS = sapply(1:8, FUN=function(i){
+  LOF_est = sapply(1:num_cores, FUN=function(j){
+    LOF_EST(d, wingweight, U_MARQRLS[[j]], betas = MARQRLS_PAR_OUT[[j]][[2*i-1]])$mean
+    })
+  list(mean=mean(LOF_est), sd=sd(LOF_est) / sqrt(num_cores))})
+```
+
+## Senstivity Analysis For RQR
+
+``` {r SA OQR}
+# var_rate_MARQRLS = lm(log(vars_MARQRLS) ~ log(c(2^10,2^11, 2^12, 2^13, 2^14, 2^15, 2^16, 2^17)))$coefficients[[2]]
+output = sensitivity_analysis_ABS_out(n,d,U_MARQRLS,num_cores, wing_data, betasMARQRLS_Q, betaerrMARQRLS_Q, LOF_MARQRLS[1,8]$mean,LOF_MARQRLS[2,8]$sd, end_time_MARQRLS[[3]])
+
+
+write.csv(output, file="C:/Users/arsemmet/Desktop/QR Research/ABS/wings_results_MARQRLS.csv")
+```
+```{r}
+True_rate_MARQRLS = lm(log(apply(betaerrMARQRLS_Q, MARGIN=1, mean)) ~ log(1:n))$coefficients[[2]]
+LOF_rate_MARQRLS = lm(log(unlist(LOF_MARQRLS[1,])) ~ log(c(2^10,2^11, 2^12, 2^13, 2^14, 2^15, 2^16, 2^17)))$coefficients[[2]]
+```
+
+## Results
+
+```{r LOF fits}
+plot(log(c(2^10,2^11, 2^12, 2^13, 2^14, 2^15, 2^16, 2^17)), log(unlist(LOF_RQR[1,])), xlab="log(n)", ylab="log(LOF)", ylim=c(-9,5.5), col="blue")
+lines(log(c(2^10,2^11, 2^12, 2^13, 2^14, 2^15, 2^16, 2^17)), log(unlist(LOF_RQR[1,])), col="blue")
+points(log(c(2^10,2^11, 2^12, 2^13, 2^14, 2^15, 2^16, 2^17)), log(unlist(LOF_QRS[1,])),col="green")
+lines(log(c(2^10,2^11, 2^12, 2^13, 2^14, 2^15, 2^16, 2^17)), log(unlist(LOF_QRS[1,])),col="green")
+points(log(c(2^10,2^11, 2^12, 2^13, 2^14, 2^15, 2^16, 2^17)), log(unlist(LOF_MARQR[1,])), col="purple")
+lines(log(c(2^10,2^11, 2^12, 2^13, 2^14, 2^15, 2^16, 2^17)), log(unlist(LOF_MARQR[1,])), col="purple")
+points(log(c(2^10,2^11, 2^12, 2^13, 2^14, 2^15, 2^16, 2^17)), log(unlist(LOF_MARQRSA[1,])), col="pink")
+lines(log(c(2^10,2^11, 2^12, 2^13, 2^14, 2^15, 2^16, 2^17)), log(unlist(LOF_MARQRSA[1,])), col="pink")
+points(log(c(2^10,2^11, 2^12, 2^13, 2^14, 2^15, 2^16, 2^17)), log(unlist(LOF_MARQRLS[1,])), col="black")
+lines(log(c(2^10,2^11, 2^12, 2^13, 2^14, 2^15, 2^16, 2^17)), log(unlist(LOF_MARQRLS[1,])), col="black")
+legend(10, 5.5, legend=c(paste0("RQR (", round(LOF_rate_RQR, 4), ")"), paste0("QRS (", round(LOF_rate_QRS, 4), ")"), paste0("MARQRNS (", round(LOF_rate_MARQR, 4), ")"), paste0("MARQRSA (", round(LOF_rate_MARQRSA, 4), ")"),  paste0("MARQRLS (", round(LOF_rate_MARQRLS, 4), ")")),
+       col=c("blue", "green", "purple", "pink", "black"), lty=1)
+```
+
+```{r Beta Err fits}
+# LOF curves
+plot(log(1:n), log(apply(betaerrRQR_Q, MARGIN =1, FUN=mean)), xlab="log(n)", ylim=c(-5,30), 
+     col="blue", type="l", main="The Average True Beta Difference curves on the log-scale",
+     ylab="log(Beta_diff)")
+lines(log(1:n), log(apply(betaerrQRS_Q, MARGIN =1, FUN=mean)), col="green")
+lines(log(1:n), log(apply(betaerrMARQR_Q, MARGIN =1, FUN=mean)), col="purple")
+lines(log(1:n), log(apply(betaerrMARQRSA_Q, MARGIN =1, FUN=mean)), col="pink")
+lines(log(1:n), log(apply(betaerrMARQRLS_Q, MARGIN =1, FUN=mean)), col="black")
+legend(1, 12, legend=c(paste0("RQR (", round(True_rate_RQR, 4), ")"), paste0("QRS (", round(True_rate_QRS, 4), ")"), paste0("MARQR (", round(True_rate_MARQR, 4), ")"), paste0("MAQRSA (", round(True_rate_MARQRSA, 4), ")"), paste0("MARQRLS (", round(True_rate_MARQRLS, 4), ")")),
+       col=c("blue", "green", "purple", "pink", "black"), lty=1)
+```
+
+
+```{r runtime}
+end_time_SQR[[3]]
+end_time_RQR[[3]]
+end_time_MARQR[[3]]
+end_time_MARQRSA[[3]]
+end_time_MARQRLS[[3]]
+```
